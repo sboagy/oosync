@@ -39,7 +39,7 @@ export function testLastWriteWinsRemote() {
   console.log("\n=== Test: Last-Write-Wins (Remote Newer) ===");
 
   const conflict: SyncConflict = {
-    tableName: "tune",
+    tableName: "entity_table",
     recordId: "1",
     localVersion: 5,
     remoteVersion: 6,
@@ -63,7 +63,7 @@ export function testLastWriteWinsLocal() {
   console.log("\n=== Test: Last-Write-Wins (Local Newer) ===");
 
   const conflict: SyncConflict = {
-    tableName: "tune",
+    tableName: "entity_table",
     recordId: "1",
     localVersion: 5,
     remoteVersion: 6,
@@ -87,7 +87,7 @@ export function testLocalWins() {
   console.log("\n=== Test: Local-Wins Strategy ===");
 
   const conflict: SyncConflict = {
-    tableName: "tune",
+    tableName: "entity_table",
     recordId: "1",
     localVersion: 5,
     remoteVersion: 6,
@@ -111,7 +111,7 @@ export function testRemoteWins() {
   console.log("\n=== Test: Remote-Wins Strategy ===");
 
   const conflict: SyncConflict = {
-    tableName: "tune",
+    tableName: "entity_table",
     recordId: "1",
     localVersion: 5,
     remoteVersion: 6,

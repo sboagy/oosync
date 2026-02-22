@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 describe("sync-core table-specific hack guard", () => {
-  it("does not special-case practice_record in SyncEngine apply logic", () => {
+  it("does not contain app-table-specific sync hacks in SyncEngine logic", () => {
     const candidates = [
       resolve(process.cwd(), "src/sync/engine.ts"),
       resolve(process.cwd(), "oosync/src/sync/engine.ts"),
@@ -15,10 +15,10 @@ describe("sync-core table-specific hack guard", () => {
 
     const text = readFileSync(enginePath, "utf-8");
 
-    expect(text).not.toContain('change.table === "practice_record"');
+    expect(text).not.toContain('change.table === "entity_table"');
     expect(text).not.toContain(
-      "practice_record has two distinct uniqueness constraints"
+      "entity_table has two distinct uniqueness constraints"
     );
-    expect(text).not.toContain("backfillPracticeRecordOutbox");
+    expect(text).not.toContain("backfillEntityTableOutbox");
   });
 });

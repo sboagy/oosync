@@ -64,10 +64,7 @@ The schema-agnostic worker can optionally emit extra diagnostic lines for troubl
 - Worker (this package): set `SYNC_DIAGNOSTICS=true` to include `debug[]` lines in sync responses.
 - Optional: set `SYNC_DIAGNOSTICS_USER_ID=<supabase auth uid>` to restrict worker diagnostics to one user.
 
-For TuneTrees-specific setup and deployment examples, see:
-
-- `docs/development/setup.md`
-- `docs/development/deployment.md`
+For consumer-specific setup and deployment examples, use your application repository docs.
 
 ## `oosync.codegen.config.json` (developer-facing)
 
@@ -194,7 +191,7 @@ For pull rules with `kind: "rpc"`, use `paramMap` (not `params`) to bind each RP
   "functionName": "sync_get_user_notes",
   "paramMap": {
     "p_user_id": { "source": "authUserId" },
-    "p_genre_ids": { "source": "collection", "collection": "selectedGenres" },
+    "p_item_ids": { "source": "collection", "collection": "selectedItems" },
     "p_after_timestamp": { "source": "lastSyncAt" },
     "p_limit": { "source": "pageLimit" },
     "p_offset": { "source": "pageOffset" }
@@ -233,14 +230,14 @@ Example (override only what you need):
     "config": {
       "push": {
         "tableRules": {
-          "practice_record": {
+          "activity_log": {
             "upsert": {
               "omitSetProps": ["id"],
-              "retryMinimalPayloadKeepProps": ["id", "playlistRef", "tuneRef"]
+              "retryMinimalPayloadKeepProps": ["id", "collectionRef", "itemRef"]
             },
             "sanitize": {
               "ensureSyncProps": true,
-              "nullIfEmptyStringProps": ["practiced", "due"]
+              "nullIfEmptyStringProps": ["performedAt", "dueAt"]
             }
           }
         }
@@ -273,10 +270,10 @@ Supported tags:
 Examples:
 
 ```sql
-comment on table public.playlist is '@oosync.changeCategory=repertoire';
+comment on table public.collection is '@oosync.changeCategory=collection';
 comment on table public.internal_debug is '@oosync.exclude';
-comment on table public.practice_record is '@oosync.normalizeDatetime=practiced,due,backup_practiced';
-comment on table public.playlist_tune is '@oosync.ownerColumn=user_ref';
+comment on table public.activity_log is '@oosync.normalizeDatetime=performed_at,due_at,backup_performed_at';
+comment on table public.collection_item is '@oosync.ownerColumn=user_ref';
 ```
 
 Notes:

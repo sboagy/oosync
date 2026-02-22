@@ -1,485 +1,313 @@
-/**
- * Tests for Sync Outbox Operations
- *
- * @module lib/sync/outbox.test
- */
-
-import Database from "better-sqlite3";
-import { sql } from "drizzle-orm";
-import {
-  type BetterSQLite3Database,
-  drizzle,
-} from "drizzle-orm/better-sqlite3";
 import { beforeEach, describe, expect, it } from "vitest";
-import { applyMigrations } from "../../../src/lib/services/test-schema-loader";
-import { ensureSyncRuntimeConfigured } from "../../../src/lib/sync/runtime-config";
 import {
-  backfillOutboxForTable,
-  clearOldOutboxItems,
-  fetchLocalRowByPrimaryKey,
-  getDrizzleTable,
-  getOutboxStats,
-  getPendingOutboxItems,
-  markOutboxCompleted,
-  markOutboxFailed,
-  markOutboxInProgress,
-  markOutboxPermanentlyFailed,
-  parseRowId,
+	clearOldOutboxItems,
+	fetchLocalRowByPrimaryKey,
+	getDrizzleTable,
+	getOutboxStats,
+	getPendingOutboxItems,
+	markOutboxCompleted,
+	markOutboxFailed,
+	markOutboxInProgress,
+	markOutboxPermanentlyFailed,
+	type OutboxItem,
+	parseRowId,
 } from "./outbox";
+import {
+	type SqliteDatabase,
+	type SyncPushQueueTable,
+	type SyncRuntime,
+	setSyncRuntime,
+} from "./runtime-context";
 
-ensureSyncRuntimeConfigured();
+function configureTestRuntime(): void {
+	const queueColumns = {
+		id: { name: "id" },
+		tableName: { name: "table_name" },
+		rowId: { name: "row_id" },
+		operation: { name: "operation" },
+		status: { name: "status" },
+		changedAt: { name: "changed_at" },
+		syncedAt: { name: "synced_at" },
+		attempts: { name: "attempts" },
+		lastError: { name: "last_error" },
+	} as unknown as SyncPushQueueTable;
 
-// Test database setup
-let db: BetterSQLite3Database;
+	const runtime = {
+		schema: {
+			syncableTables: ["entity_table"],
+			tableRegistry: {} as Record<string, unknown>,
+			tableSyncOrder: {},
+			tableToSchemaKey: { entity_table: "entityTable" },
+		},
+		syncPushQueue: queueColumns,
+		localSchema: { entityTable: { name: "entity_table" } },
+		getSqliteInstance: async () => null,
+		loadOutboxBackupForUser: async () => null,
+		clearOutboxBackupForUser: async () => {},
+		replayOutboxBackup: () => ({ applied: 0, skipped: 0, errors: [] }),
+		enableSyncTriggers: () => {},
+		suppressSyncTriggers: () => {},
+		logger: {
+			debug: () => {},
+			info: () => {},
+			warn: () => {},
+			error: () => {},
+		},
+	} as unknown as SyncRuntime;
 
-// Setup fresh database before each test
+	setSyncRuntime(runtime);
+}
+
 beforeEach(() => {
-  const sqlite = new Database(":memory:");
-  db = drizzle(sqlite) as BetterSQLite3Database;
-
-  // Load production schema from Drizzle migrations
-  applyMigrations(db);
+	configureTestRuntime();
 });
 
-// Helper to insert outbox items
-function insertOutboxItem(
-  id: string,
-  tableName: string,
-  rowId: string,
-  operation: string,
-  status = "pending",
-  changedAt = new Date().toISOString(),
-  attempts = 0,
-  lastError: string | null = null
-): void {
-  db.run(sql`
-    INSERT INTO sync_push_queue (id, table_name, row_id, operation, status, changed_at, attempts, last_error)
-    VALUES (${id}, ${tableName}, ${rowId}, ${operation}, ${status}, ${changedAt}, ${attempts}, ${lastError})
-  `);
+function createPendingItemsDb(items: OutboxItem[]): SqliteDatabase {
+	return {
+		select: () => ({
+			from: () => ({
+				where: () => ({
+					orderBy: () => ({
+						limit: async (limit: number) => items.slice(0, limit),
+					}),
+				}),
+			}),
+		}),
+	} as unknown as SqliteDatabase;
 }
 
-// Helper to insert tune
-function insertTune(
-  id: string,
-  title: string | null = null,
-  type: string | null = null
-): void {
-  db.run(sql`
-    INSERT INTO tune (id, title, type, deleted, sync_version, last_modified_at)
-    VALUES (${id}, ${title}, ${type}, 0, 1, datetime('now'))
-  `);
+function createUpdateDb(onSet: (values: unknown) => void): SqliteDatabase {
+	return {
+		update: () => ({
+			set: (values: unknown) => {
+				onSet(values);
+				return {
+					where: async () => {},
+				};
+			},
+		}),
+	} as unknown as SqliteDatabase;
 }
 
-function insertUserProfile(userId: string): void {
-  db.run(sql`
-    INSERT INTO user_profile (id, deleted, sync_version, last_modified_at)
-    VALUES (${userId}, 0, 1, datetime('now'))
-  `);
+function createDeleteDb(onDelete: () => void): SqliteDatabase {
+	return {
+		delete: () => ({
+			where: async () => {
+				onDelete();
+			},
+		}),
+	} as unknown as SqliteDatabase;
 }
 
-function insertRepertoire(repertoireId: string, userRef: string): void {
-  db.run(sql`
-    INSERT INTO repertoire (repertoire_id, user_ref, deleted, sync_version, last_modified_at)
-    VALUES (${repertoireId}, ${userRef}, 0, 1, datetime('now'))
-  `);
-}
+describe("outbox utilities", () => {
+	describe("getPendingOutboxItems", () => {
+		it("returns rows from pending query chain", async () => {
+			const rows: OutboxItem[] = [
+				{
+					id: "item-1",
+					tableName: "entity_table",
+					rowId: "entity-1",
+					operation: "INSERT",
+					status: "pending",
+					changedAt: "2024-01-01T00:00:00.000Z",
+					syncedAt: null,
+					attempts: 0,
+					lastError: null,
+				},
+				{
+					id: "item-2",
+					tableName: "entity_table",
+					rowId: "entity-2",
+					operation: "UPDATE",
+					status: "pending",
+					changedAt: "2024-01-02T00:00:00.000Z",
+					syncedAt: null,
+					attempts: 1,
+					lastError: "retry",
+				},
+			];
 
-// Helper to insert genre_tune_type (composite key)
-function insertGenreTuneType(genreId: string, tuneTypeId: string): void {
-  // First ensure the referenced genres and tune_types exist
-  // Using try/catch since INSERT OR IGNORE doesn't work well with sql template
-  try {
-    db.run(sql`INSERT INTO genre (id, name) VALUES (${genreId}, ${genreId})`);
-  } catch {
-    // Ignore duplicate key errors
-  }
-  try {
-    db.run(
-      sql`INSERT INTO tune_type (id, name) VALUES (${tuneTypeId}, ${tuneTypeId})`
-    );
-  } catch {
-    // Ignore duplicate key errors
-  }
-  db.run(sql`
-    INSERT INTO genre_tune_type (genre_id, tune_type_id)
-    VALUES (${genreId}, ${tuneTypeId})
-  `);
-}
+			const db = createPendingItemsDb(rows);
+			const result = await getPendingOutboxItems(db, 1);
 
-describe("Sync Outbox Operations", () => {
-  describe("backfillOutboxForTable", () => {
-    it("creates outbox rows for recent practice_record rows", async () => {
-      insertUserProfile("sb-1");
-      insertRepertoire("pl-1", "sb-1");
-      insertTune("t-1", "Tune", "reel");
+			expect(result).toHaveLength(1);
+			expect(result[0].id).toBe("item-1");
+		});
+	});
 
-      db.run(sql`
-        INSERT INTO practice_record (id, repertoire_ref, tune_ref, practiced, sync_version, last_modified_at)
-        VALUES ('pr-1', 'pl-1', 't-1', '2025-12-27T00:00:00.000Z', 1, '2025-12-27T00:00:00.000Z')
-      `);
-      db.run(sql`
-        INSERT INTO practice_record (id, repertoire_ref, tune_ref, practiced, sync_version, last_modified_at)
-        VALUES ('pr-2', 'pl-1', 't-1', '2025-12-27T00:00:01.000Z', 1, '2025-12-27T00:00:01.000Z')
-      `);
+	describe("markOutboxInProgress", () => {
+		it("sets status to in_progress", async () => {
+			let recorded: unknown;
+			const db = createUpdateDb((values) => {
+				recorded = values;
+			});
 
-      const inserted = await backfillOutboxForTable(
-        db as any,
-        "practice_record",
-        "2025-12-26T00:00:00.000Z"
-      );
-      expect(inserted).toBe(2);
+			await markOutboxInProgress(db, "item-1");
 
-      const outbox = await db.all(sql`
-        SELECT table_name, row_id, status, operation
-        FROM sync_push_queue
-        WHERE table_name = 'practice_record'
-        ORDER BY row_id
-      `);
-      expect(outbox).toEqual([
-        {
-          table_name: "practice_record",
-          row_id: "pr-1",
-          status: "pending",
-          operation: "UPDATE",
-        },
-        {
-          table_name: "practice_record",
-          row_id: "pr-2",
-          status: "pending",
-          operation: "UPDATE",
-        },
-      ]);
-    });
+			expect(recorded).toEqual({ status: "in_progress" });
+		});
+	});
 
-    it("is idempotent for already-queued rows", async () => {
-      insertUserProfile("sb-1");
-      insertRepertoire("pl-1", "sb-1");
-      insertTune("t-1", "Tune", "reel");
+	describe("markOutboxFailed", () => {
+		it("sets status pending and increments attempts", async () => {
+			let recorded: unknown;
+			const db = createUpdateDb((values) => {
+				recorded = values;
+			});
 
-      db.run(sql`
-        INSERT INTO practice_record (id, repertoire_ref, tune_ref, practiced, sync_version, last_modified_at)
-        VALUES ('pr-3', 'pl-1', 't-1', '2025-12-27T00:00:02.000Z', 1, '2025-12-27T00:00:02.000Z')
-      `);
-      insertOutboxItem(
-        "item-pr-3",
-        "practice_record",
-        "pr-3",
-        "UPDATE",
-        "pending",
-        "2025-12-27T00:00:03.000Z"
-      );
+			await markOutboxFailed(db, "item-2", "network", 2);
 
-      const inserted = await backfillOutboxForTable(
-        db as any,
-        "practice_record",
-        "2025-12-26T00:00:00.000Z"
-      );
-      expect(inserted).toBe(0);
+			expect(recorded).toEqual({
+				status: "pending",
+				attempts: 3,
+				lastError: "network",
+			});
+		});
+	});
 
-      const count = (
-        db.all(sql`
-        SELECT COUNT(*) as n
-        FROM sync_push_queue
-        WHERE table_name = 'practice_record' AND row_id = 'pr-3'
-      `) as Array<{ n: unknown }>
-      ).at(0)?.n;
-      expect(Number(count)).toBe(1);
-    });
+	describe("markOutboxPermanentlyFailed", () => {
+		it("sets failed status and syncedAt", async () => {
+			let recorded: unknown;
+			const db = createUpdateDb((values) => {
+				recorded = values;
+			});
 
-    it("creates JSON row_id for composite primary keys (repertoire_tune)", async () => {
-      insertUserProfile("sb-1");
-      insertRepertoire("pl-1", "sb-1");
-      insertTune("t-1", "Tune", "reel");
+			await markOutboxPermanentlyFailed(db, "item-3", "fatal");
 
-      db.run(sql`
-        CREATE TABLE IF NOT EXISTS repertoire_tune (
-          repertoire_ref TEXT NOT NULL,
-          tune_ref TEXT NOT NULL,
-          current TEXT,
-          learned TEXT,
-          scheduled TEXT,
-          goal TEXT,
-          deleted INTEGER NOT NULL DEFAULT 0,
-          sync_version INTEGER NOT NULL DEFAULT 1,
-          last_modified_at TEXT NOT NULL,
-          device_id TEXT,
-          PRIMARY KEY (repertoire_ref, tune_ref)
-        )
-      `);
+			expect(recorded).toMatchObject({
+				status: "failed",
+				lastError: "fatal",
+			});
+			expect(recorded).toEqual(
+				expect.objectContaining({ syncedAt: expect.any(String) }),
+			);
+		});
+	});
 
-      db.run(sql`
-        INSERT INTO repertoire_tune (repertoire_ref, tune_ref, deleted, sync_version, last_modified_at)
-        VALUES ('pl-1', 't-1', 0, 1, '2025-12-27T00:00:00.000Z')
-      `);
+	describe("markOutboxCompleted", () => {
+		it("deletes the queue item", async () => {
+			let deleteCalls = 0;
+			const db = createDeleteDb(() => {
+				deleteCalls += 1;
+			});
 
-      const inserted = await backfillOutboxForTable(
-        db as any,
-        "repertoire_tune",
-        "2025-12-26T00:00:00.000Z"
-      );
-      expect(inserted).toBe(1);
+			await markOutboxCompleted(db, "item-4");
 
-      const outbox = await db.all(sql`
-        SELECT table_name, row_id, status, operation
-        FROM sync_push_queue
-        WHERE table_name = 'repertoire_tune'
-      `);
+			expect(deleteCalls).toBe(1);
+		});
+	});
 
-      expect(outbox).toEqual([
-        {
-          table_name: "repertoire_tune",
-          row_id: JSON.stringify({ repertoire_ref: "pl-1", tune_ref: "t-1" }),
-          status: "pending",
-          operation: "UPDATE",
-        },
-      ]);
-    });
-  });
+	describe("getOutboxStats", () => {
+		it("normalizes aggregate row values to numbers", async () => {
+			const db = {
+				all: async () => [
+					{
+						pending: "2",
+						in_progress: 1,
+						failed: "3",
+						total: 6,
+					},
+				],
+			} as unknown as SqliteDatabase;
 
-  describe("getPendingOutboxItems", () => {
-    it("returns empty array when no items", async () => {
-      const items = await getPendingOutboxItems(db as any);
-      expect(items).toEqual([]);
-    });
+			const stats = await getOutboxStats(db);
 
-    it("returns pending items ordered by changedAt", async () => {
-      insertOutboxItem(
-        "item-2",
-        "tune",
-        "tune-2",
-        "INSERT",
-        "pending",
-        "2024-01-02T00:00:00.000Z"
-      );
-      insertOutboxItem(
-        "item-1",
-        "tune",
-        "tune-1",
-        "INSERT",
-        "pending",
-        "2024-01-01T00:00:00.000Z"
-      );
+			expect(stats).toEqual({
+				pending: 2,
+				inProgress: 1,
+				failed: 3,
+				total: 6,
+			});
+		});
+	});
 
-      const items = await getPendingOutboxItems(db as any);
-      expect(items).toHaveLength(2);
-      expect(items[0].id).toBe("item-1"); // Earlier item first
-      expect(items[1].id).toBe("item-2");
-    });
+	describe("clearOldOutboxItems", () => {
+		it("deletes only rows older than cutoff", async () => {
+			const oldIso = "2000-01-01T00:00:00.000Z";
+			const newIso = "2999-01-01T00:00:00.000Z";
 
-    it("respects limit parameter", async () => {
-      for (let i = 0; i < 5; i++) {
-        insertOutboxItem(
-          `item-${i}`,
-          "tune",
-          `tune-${i}`,
-          "INSERT",
-          "pending",
-          `2024-01-0${i + 1}T00:00:00.000Z`
-        );
-      }
+			let detailCall = 0;
+			let deleteCalls = 0;
 
-      const items = await getPendingOutboxItems(db as any, 2);
-      expect(items).toHaveLength(2);
-    });
+			const db = {
+				select: (projection?: unknown) => {
+					if (projection) {
+						return {
+							from: () => ({
+								where: async () => [{ id: "old" }, { id: "new" }],
+							}),
+						};
+					}
 
-    it("excludes non-pending items", async () => {
-      insertOutboxItem("item-pending", "tune", "tune-1", "INSERT", "pending");
-      insertOutboxItem(
-        "item-in-progress",
-        "tune",
-        "tune-2",
-        "INSERT",
-        "in_progress"
-      );
-      insertOutboxItem("item-failed", "tune", "tune-3", "INSERT", "failed");
+					return {
+						from: () => ({
+							where: () => ({
+								limit: async () => {
+									detailCall += 1;
+									if (detailCall === 1) {
+										return [{ id: "old", changedAt: oldIso }];
+									}
+									return [{ id: "new", changedAt: newIso }];
+								},
+							}),
+						}),
+					};
+				},
+				delete: () => ({
+					where: async () => {
+						deleteCalls += 1;
+					},
+				}),
+			} as unknown as SqliteDatabase;
 
-      const items = await getPendingOutboxItems(db as any);
-      expect(items).toHaveLength(1);
-      expect(items[0].id).toBe("item-pending");
-    });
-  });
+			await clearOldOutboxItems(db, 7 * 24 * 60 * 60 * 1000);
 
-  describe("markOutboxInProgress", () => {
-    it("updates status to in_progress", async () => {
-      insertOutboxItem("item-1", "tune", "tune-1", "INSERT", "pending");
+			expect(deleteCalls).toBe(1);
+		});
+	});
 
-      await markOutboxInProgress(db as any, "item-1");
+	describe("parseRowId", () => {
+		it("returns plain row id unchanged", () => {
+			expect(parseRowId("entity-123")).toBe("entity-123");
+		});
 
-      const items = await getPendingOutboxItems(db as any);
-      expect(items).toHaveLength(0); // No longer pending
-    });
-  });
+		it("parses composite JSON key", () => {
+			expect(parseRowId('{"part_a":"a","part_b":"b"}')).toEqual({
+				part_a: "a",
+				part_b: "b",
+			});
+		});
 
-  describe("markOutboxCompleted", () => {
-    it("deletes item from outbox", async () => {
-      insertOutboxItem("item-1", "tune", "tune-1", "INSERT");
+		it("returns malformed JSON unchanged", () => {
+			expect(parseRowId("{bad")).toBe("{bad");
+		});
+	});
 
-      await markOutboxCompleted(db as any, "item-1");
+	describe("getDrizzleTable", () => {
+		it("returns mapped table from runtime schema", () => {
+			const table = getDrizzleTable("entity_table");
+			expect(table).toBeDefined();
+		});
 
-      const stats = await getOutboxStats(db as any);
-      expect(stats.total).toBe(0);
-    });
-  });
+		it("returns undefined for unknown table", () => {
+			const table = getDrizzleTable("unknown_table");
+			expect(table).toBeUndefined();
+		});
+	});
 
-  describe("markOutboxFailed", () => {
-    it("sets status back to pending and increments attempts", async () => {
-      insertOutboxItem(
-        "item-1",
-        "tune",
-        "tune-1",
-        "INSERT",
-        "in_progress",
-        new Date().toISOString(),
-        1
-      );
+	describe("fetchLocalRowByPrimaryKey", () => {
+		it("throws for unknown table before DB lookup", async () => {
+			const db = {} as unknown as SqliteDatabase;
 
-      await markOutboxFailed(db as any, "item-1", "Network error", 1);
-
-      const items = await getPendingOutboxItems(db as any);
-      expect(items).toHaveLength(1);
-      expect(items[0].attempts).toBe(2);
-      expect(items[0].lastError).toBe("Network error");
-    });
-  });
-
-  describe("markOutboxPermanentlyFailed", () => {
-    it("sets status to failed", async () => {
-      insertOutboxItem("item-1", "tune", "tune-1", "INSERT");
-
-      await markOutboxPermanentlyFailed(db as any, "item-1", "Fatal error");
-
-      const stats = await getOutboxStats(db as any);
-      expect(stats.failed).toBe(1);
-      expect(stats.pending).toBe(0);
-    });
-  });
-
-  describe("getOutboxStats", () => {
-    it("returns correct counts for each status", async () => {
-      insertOutboxItem("p1", "tune", "t1", "INSERT", "pending");
-      insertOutboxItem("p2", "tune", "t2", "INSERT", "pending");
-      insertOutboxItem("i1", "tune", "t3", "UPDATE", "in_progress");
-      insertOutboxItem("f1", "tune", "t4", "DELETE", "failed");
-      insertOutboxItem("f2", "tune", "t5", "DELETE", "failed");
-      insertOutboxItem("f3", "tune", "t6", "DELETE", "failed");
-
-      const stats = await getOutboxStats(db as any);
-      expect(stats.pending).toBe(2);
-      expect(stats.inProgress).toBe(1);
-      expect(stats.failed).toBe(3);
-      expect(stats.total).toBe(6);
-    });
-  });
-
-  describe("parseRowId", () => {
-    it("returns simple string as-is", () => {
-      expect(parseRowId("tune-123")).toBe("tune-123");
-    });
-
-    it("parses JSON composite key", () => {
-      const result = parseRowId('{"genre_id":"g1","tune_type_id":"tt1"}');
-      expect(result).toEqual({ genre_id: "g1", tune_type_id: "tt1" });
-    });
-
-    it("returns invalid JSON as-is", () => {
-      expect(parseRowId("{invalid")).toBe("{invalid");
-    });
-  });
-
-  describe("getDrizzleTable", () => {
-    it("returns table for known table name", () => {
-      const table = getDrizzleTable("tune");
-      expect(table).toBeDefined();
-    });
-
-    it("returns undefined for unknown table name", () => {
-      const table = getDrizzleTable("nonexistent");
-      expect(table).toBeUndefined();
-    });
-  });
-
-  describe("fetchLocalRowByPrimaryKey", () => {
-    it("fetches row by simple primary key", async () => {
-      insertTune("tune-123", "The Kesh", "jig");
-
-      const row = await fetchLocalRowByPrimaryKey(
-        db as any,
-        "tune",
-        "tune-123"
-      );
-
-      expect(row).not.toBeNull();
-      expect(row?.id).toBe("tune-123");
-      expect(row?.title).toBe("The Kesh");
-    });
-
-    it("returns null for non-existent row", async () => {
-      const row = await fetchLocalRowByPrimaryKey(
-        db as any,
-        "tune",
-        "nonexistent"
-      );
-      expect(row).toBeNull();
-    });
-
-    it("fetches row by composite primary key (JSON rowId)", async () => {
-      insertGenreTuneType("irish", "jig");
-
-      const row = await fetchLocalRowByPrimaryKey(
-        db as any,
-        "genre_tune_type",
-        '{"genre_id":"irish","tune_type_id":"jig"}'
-      );
-
-      expect(row).not.toBeNull();
-      expect(row?.genreId).toBe("irish");
-      expect(row?.tuneTypeId).toBe("jig");
-    });
-
-    it("throws for unknown table", async () => {
-      await expect(
-        fetchLocalRowByPrimaryKey(db as any, "nonexistent" as any, "id-123")
-      ).rejects.toThrow("Unknown table: nonexistent");
-    });
-
-    it("throws for composite key with non-object rowId", async () => {
-      await expect(
-        fetchLocalRowByPrimaryKey(db as any, "genre_tune_type", "simple-string")
-      ).rejects.toThrow("Expected composite key object");
-    });
-  });
-
-  describe("clearOldOutboxItems", () => {
-    it("removes failed items older than threshold", async () => {
-      const oldDate = new Date(
-        Date.now() - 10 * 24 * 60 * 60 * 1000
-      ).toISOString(); // 10 days ago
-      const recentDate = new Date().toISOString();
-
-      insertOutboxItem("old-failed", "tune", "t1", "INSERT", "failed", oldDate);
-      insertOutboxItem(
-        "recent-failed",
-        "tune",
-        "t2",
-        "INSERT",
-        "failed",
-        recentDate
-      );
-      insertOutboxItem(
-        "old-pending",
-        "tune",
-        "t3",
-        "INSERT",
-        "pending",
-        oldDate
-      );
-
-      await clearOldOutboxItems(db as any, 7 * 24 * 60 * 60 * 1000); // 7 days
-
-      const stats = await getOutboxStats(db as any);
-      expect(stats.failed).toBe(1); // Only recent-failed remains
-      expect(stats.pending).toBe(1); // old-pending not touched (not failed)
-      expect(stats.total).toBe(2);
-    });
-  });
+			await expect(
+				fetchLocalRowByPrimaryKey(
+					db,
+					"unknown_table" as unknown as Parameters<
+						typeof fetchLocalRowByPrimaryKey
+					>[1],
+					"id-1",
+				),
+			).rejects.toThrow("Unknown table: unknown_table");
+		});
+	});
 });

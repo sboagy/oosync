@@ -38,15 +38,15 @@ These exist to keep `oosync` future-standalone.
 
 oosync must be purely generic. **No application-specific references** of any kind:
 
-- ❌ **Hardcoded table names**: `if (tableName === "tune")` or `"SELECT * FROM user_genre_selection"`
-- ❌ **Hardcoded column names**: `record.genre`, `tune.private_for` (unless from config/contract)
-- ❌ **Hardcoded collection names**: `ctx.collections.selectedGenres` (unless from config)
-- ❌ **App-specific concepts in strings**: `"genreFilter"`, `"catalogTable"`, `"practiceRecord"`
+- ❌ **Hardcoded table names**: `if (tableName === "entity_table")` or `"SELECT * FROM app_link_table"`
+- ❌ **Hardcoded column names**: `record.category`, `entity_table.private_for` (unless from config/contract)
+- ❌ **Hardcoded collection names**: `ctx.collections.selectedItems` (unless from config)
+- ❌ **App-specific concepts in strings**: `"domainFilter"`, `"catalogTable"`, `"activityRecord"`
 - ❌ **Schema assumptions in logic**: Assuming FK relationships, JOIN patterns, or filtering rules
 
 - ✅ **Config-driven references**: Table/column names from `oosync.codegen.config.json` or generated contract
 - ✅ **Generic type variants**: `PullTableRule` with `kind: "rpc"` (doesn't specify which RPCs exist)
-- ✅ **Parameter mapping**: RPC `params: ["userId", "genreIds"]` where values come from generated config
+- ✅ **Parameter mapping**: RPC `params: ["userId", "itemIds"]` where values come from generated config
 - ✅ **Collection registry**: `ctx.collections[collectionName]` where collection names from config
 
 **Schema assumptions must be via**:
