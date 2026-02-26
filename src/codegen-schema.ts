@@ -73,6 +73,31 @@ function formatWithBiome(targetPath: string, content: string): string {
   }
 }
 
+function resolveDrizzleKitBin(): string {
+  const binDir = path.join(__dirname, "../../node_modules/.bin");
+  const binName = process.platform === "win32" ? "drizzle-kit.cmd" : "drizzle-kit";
+  const localBin = path.join(binDir, binName);
+  return fs.existsSync(localBin) ? localBin : binName;
+}
+
+function runDrizzleKitGenerate(drizzleConfigPath: string): void {
+  const bin = resolveDrizzleKitBin();
+  const result = spawnSync(bin, ["generate", "--config", drizzleConfigPath], {
+    encoding: "utf8",
+    stdio: "inherit",
+    cwd: process.cwd(),
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const configExists = fs.existsSync(drizzleConfigPath);
+    throw new Error(
+      `drizzle-kit generate failed (exit ${result.status}). Config: ${drizzleConfigPath}${
+        configExists ? "" : " (file not found)"
+      }. Check the drizzle-kit output above for details.`
+    );
+  }
+}
+
 function isLocalSupabaseDatabaseUrl(databaseUrl: string): boolean {
   try {
     const url = new URL(databaseUrl);
@@ -128,6 +153,12 @@ interface ICodegenConfigFile {
     appTableMetaFile?: string;
     workerPgSchemaFile?: string;
     workerConfigFile?: string;
+    /**
+     * Path to a drizzle.config.*.ts file for the SQLite target.
+     * When set, codegen runs `drizzle-kit generate --config <path>` after
+     * writing the SQLite schema, producing the incremental .sql migration file.
+     */
+    sqliteDrizzleConfig?: string;
   };
   tableMeta?: {
     /** Legacy whitelist (prefer excludeTables). */
@@ -2060,6 +2091,12 @@ async function main(): Promise<void> {
       : path.join(process.cwd(), config.outputs.workerConfigFile)
     : DEFAULT_OUTPUT_WORKER_CONFIG_FILE;
 
+  const outputSqliteDrizzleConfig = config.outputs?.sqliteDrizzleConfig
+    ? path.isAbsolute(config.outputs.sqliteDrizzleConfig)
+      ? config.outputs.sqliteDrizzleConfig
+      : path.join(process.cwd(), config.outputs.sqliteDrizzleConfig)
+    : null;
+
   const {
     columns,
     primaryKeys,
@@ -2295,6 +2332,15 @@ async function main(): Promise<void> {
 
   fs.mkdirSync(path.dirname(outputWorkerConfigFile), { recursive: true });
   fs.writeFileSync(outputWorkerConfigFile, formattedWorkerConfig, "utf8");
+
+  if (outputSqliteDrizzleConfig) {
+    runDrizzleKitGenerate(outputSqliteDrizzleConfig);
+    // eslint-disable-next-line no-console
+    console.log(
+      `✅ drizzle-kit generate completed (config: ${path.relative(process.cwd(), outputSqliteDrizzleConfig)})`
+    );
+  }
+
   // eslint-disable-next-line no-console
   console.log(
     `✅ Wrote ${path.relative(process.cwd(), outputSchemaFile)}, ${path.relative(
