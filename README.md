@@ -25,10 +25,12 @@ Schema-agnostic sync tooling for Postgres ↔ SQLite (WASM) style workflows.
 Common generated outputs:
 
 - SQLite Drizzle schema (for local/offline DB)
+- Optional SQLite schema wrapper with the client-side sync outbox table
 - Shared sync table metadata (core facts)
 - App-facing `shared/table-meta.ts` (UI hints + ordering + schema-key mapping)
 - Worker Postgres schema
 - Worker config (defaults merged with overrides)
+- Optional worker entrypoint scaffold wired to generated artifacts
 
 The default output locations are configurable via `oosync.codegen.config.json`.
 
@@ -92,6 +94,8 @@ All paths are relative to your project root unless absolute.
 
 - `outputs.sqliteSchemaFile`
   - Drizzle SQLite schema output.
+- `outputs.sqliteSchemaWrapperFile`
+  - Optional wrapper around the generated SQLite schema that adds `sync_push_queue`.
 - `outputs.tableMetaFile`
   - Generated shared core table facts consumed by app + worker.
 - `outputs.appTableMetaFile`
@@ -100,6 +104,8 @@ All paths are relative to your project root unless absolute.
   - Drizzle Postgres schema used by the worker.
 - `outputs.workerConfigFile`
   - Worker config output (defaults + overrides).
+- `outputs.workerEntrypointFile`
+  - Optional worker entrypoint scaffold that injects generated artifacts into `oosync/worker`.
 
 Example:
 
@@ -107,13 +113,17 @@ Example:
 {
   "outputs": {
     "sqliteSchemaFile": "drizzle/schema-sqlite.generated.ts",
+    "sqliteSchemaWrapperFile": "drizzle/schema-sqlite.ts",
     "tableMetaFile": "shared/generated/sync/table-meta.generated.ts",
     "appTableMetaFile": "shared/table-meta.ts",
     "workerPgSchemaFile": "worker/src/generated/schema-postgres.generated.ts",
-    "workerConfigFile": "worker/src/generated/worker-config.generated.ts"
+    "workerConfigFile": "worker/src/generated/worker-config.generated.ts",
+    "workerEntrypointFile": "worker/src/index.ts"
   }
 }
 ```
+
+Generated SQLite schema files now import sync column helpers from `oosync/shared/sync-columns`, so consumers do not need to maintain a separate local `sync-columns.ts` just to use the generated schema.
 
 ### `tableMeta`
 
