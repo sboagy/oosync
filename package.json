@@ -28,7 +28,15 @@
   "scripts": {
     "codegen:schema": "tsx src/codegen-schema.ts",
     "codegen:schema:check": "tsx src/codegen-schema.ts --check",
-    "test": "vitest run src/sync/sync-core-no-table-hacks.test.ts"
+    "test": "vitest run src/sync/sync-core-no-table-hacks.test.ts",
+    "lint": "biome lint src worker",
+    "format": "biome format --write src worker",
+    "format:check": "biome format src worker",
+    "format:prettier": "prettier --write \"src/**/*.{ts,tsx,js,jsx}\" \"worker/**/*.{ts,tsx,js,jsx}\"",
+    "format:prettier:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx}\" \"worker/**/*.{ts,tsx,js,jsx}\"",
+    "check": "biome check src worker",
+    "fix": "biome check --write src worker",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p worker/tsconfig.json --noEmit"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.1",
@@ -36,6 +44,8 @@
     "postgres": "^3.4.8"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.3",
+    "@types/node": "^25.3.0",
     "@cloudflare/workers-types": "^4.20260219.0",
     "tsx": "^4.21.0",
     "typescript": "~5.9.3",

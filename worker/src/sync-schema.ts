@@ -1,5 +1,20 @@
 import { and, eq, inArray, isNull, or } from "drizzle-orm";
-import type { PgTransaction } from "drizzle-orm/pg-core";
+import type {
+  AnyPgColumn,
+  AnyPgTable,
+  PgQueryResultHKT,
+  PgTransaction,
+} from "drizzle-orm/pg-core";
+
+export type WorkerTransaction = PgTransaction<
+  PgQueryResultHKT,
+  Record<string, unknown>,
+  Record<string, never>
+>;
+export type DynamicPgTable = AnyPgTable &
+  Record<string, AnyPgColumn | undefined>;
+export type SchemaTables = Record<string, DynamicPgTable | undefined>;
+type FilterCondition = ReturnType<typeof eq>;
 
 export function snakeToCamel(snake: string): string {
   return snake.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
@@ -44,8 +59,7 @@ export interface SyncSchemaDeps {
   /** Worker-only, app-specific rules/config blob. */
   workerSyncConfig: unknown;
   /** Drizzle schema tables (camelCase, worker runtime). */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  schemaTables?: Record<string, any>;
+  schemaTables?: SchemaTables;
 }
 
 export type TableMeta = TableMetaCore;
@@ -162,9 +176,9 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
   }
 
   async function loadUserCollections(params: {
-    tx: PgTransaction<any, any, any>;
+    tx: WorkerTransaction;
     userId: string;
-    tables: Record<string, any>;
+    tables: SchemaTables;
   }): Promise<Record<string, Set<string>>> {
     const collections = getWorkerConfig().collections ?? {};
     const result: Record<string, Set<string>> = {};
@@ -195,7 +209,7 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
         .where(eq(ownerCol, params.userId));
 
-      result[name] = new Set(rows.map((r: any) => String(r.id)));
+      result[name] = new Set(rows.map((row) => String(row.id)));
     }
 
     return result;
@@ -205,11 +219,11 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     rule: PullTableRule,
     params: {
       tableName: string;
-      table: any;
+      table: DynamicPgTable;
       userId: string;
       collections: Record<string, Set<string>>;
     }
-  ): unknown[] | null {
+  ): FilterCondition[] | null {
     // RPC rules handle all filtering server-side (no WHERE clause needed)
     if (rule.kind === "rpc") {
       return []; // Empty array = no additional filters (RPC handles everything)
@@ -217,7 +231,7 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
 
     // Compound rule: evaluate each nested rules and combine with OR or AND
     if (rule.kind === "compound") {
-      const nestedConditions: any[] = [];
+      const nestedConditions: FilterCondition[] = [];
 
       for (const nestedRule of rule.rules) {
         const result = applyPullRule(nestedRule, params);
@@ -235,7 +249,8 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
       // Combine nested conditions with AND or OR (default: OR)
       const operator = rule.operator || "or";
       const combiner = operator === "and" ? and : or;
-      return [combiner(...nestedConditions) as any];
+      const combinedCondition = combiner(...nestedConditions);
+      return combinedCondition ? [combinedCondition] : null;
     }
 
     // Simple rules: resolve column and apply filter
@@ -248,7 +263,8 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     }
 
     if (rule.kind === "orNullEqUserId") {
-      return [or(isNull(col), eq(col, params.userId))];
+      const condition = or(isNull(col), eq(col, params.userId));
+      return condition ? [condition] : [];
     }
 
     if (rule.kind === "inCollection") {
@@ -262,7 +278,8 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
       const orProp = snakeToCamel(rule.orColumn);
       const orCol = params.table[orProp];
       if (!orCol) return [];
-      return [or(eq(col, params.userId), eq(orCol, true))];
+      const condition = or(eq(col, params.userId), eq(orCol, true));
+      return condition ? [condition] : [];
     }
 
     if (rule.kind === "publicOnly") {
@@ -274,36 +291,38 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
 
   function buildUserFilter(params: {
     tableName: string;
-    table: any;
+    table: DynamicPgTable;
     userId: string;
     collections: Record<string, Set<string>>;
-  }): unknown[] | null {
+  }): FilterCondition[] | null {
     const rule = getPullRule(params.tableName);
     if (rule) {
       return applyPullRule(rule, params);
     }
 
     // Heuristic fallback (schema-agnostic conventions).
-    const conditions: unknown[] = [];
+    const conditions: FilterCondition[] = [];
 
     if (params.table.userId) {
       conditions.push(eq(params.table.userId, params.userId));
     } else if (params.table.userRef) {
       conditions.push(eq(params.table.userRef, params.userId));
     } else if (params.table.privateFor) {
-      conditions.push(
-        or(
-          isNull(params.table.privateFor),
-          eq(params.table.privateFor, params.userId)
-        )
+      const condition = or(
+        isNull(params.table.privateFor),
+        eq(params.table.privateFor, params.userId)
       );
+      if (condition) {
+        conditions.push(condition);
+      }
     } else if (params.table.privateToUser) {
-      conditions.push(
-        or(
-          isNull(params.table.privateToUser),
-          eq(params.table.privateToUser, params.userId)
-        )
+      const condition = or(
+        isNull(params.table.privateToUser),
+        eq(params.table.privateToUser, params.userId)
       );
+      if (condition) {
+        conditions.push(condition);
+      }
     }
 
     return conditions;

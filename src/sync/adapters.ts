@@ -13,13 +13,13 @@
  * @module lib/sync/adapters
  */
 
-import { camelizeKeys, snakifyKeys } from "./casing";
 import {
   getBooleanColumns,
   getNormalizer,
   getPrimaryKey,
   getUniqueKeys,
 } from "../shared/table-meta";
+import { camelizeKeys, snakifyKeys } from "./casing";
 import { getSyncRuntime, type SyncableTableName } from "./runtime-context";
 
 // Re-export for convenience

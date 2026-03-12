@@ -518,10 +518,9 @@ export async function fetchLocalRowByPrimaryKey(
     const pkValue =
       typeof parsedRowId === "string" ? parsedRowId : String(parsedRowId);
 
-    const matchingRow = rows.find((row) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (row as any)[pkColumnCamel] === pkValue;
-    });
+    const matchingRow = rows.find(
+      (row) => (row as Record<string, unknown>)[pkColumnCamel] === pkValue
+    );
 
     return matchingRow ?? null;
   } else {
@@ -533,11 +532,11 @@ export async function fetchLocalRowByPrimaryKey(
     }
 
     const matchingRow = rows.find((row) => {
+      const record = row as Record<string, unknown>;
       for (const keySnake of primaryKey) {
         const keyCamel = toCamelCase(keySnake);
         const expectedValue = parsedRowId[keySnake] ?? parsedRowId[keyCamel];
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        if ((row as any)[keyCamel] !== expectedValue) {
+        if (record[keyCamel] !== expectedValue) {
           return false;
         }
       }

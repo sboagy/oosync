@@ -13,7 +13,6 @@
 
 import type { SyncRequestOverrides } from "@oosync/shared/protocol";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { toast } from "solid-sonner";
 import { SyncEngine } from "./engine";
 import type { SyncableTable } from "./queue";
 import { type RealtimeConfig, RealtimeManager } from "./realtime";
@@ -52,6 +51,12 @@ export interface SyncServiceConfig {
   userId: string | null;
   realtimeEnabled?: boolean;
   syncIntervalMs?: number;
+  notifyError?: (
+    message: string,
+    options?: {
+      duration?: number;
+    }
+  ) => void;
   /** When true, never push local changes; pull-only sync. */
   pullOnly?: boolean;
   /** Optional per-sync overrides for pull behavior. */
@@ -102,22 +107,22 @@ export class SyncService {
     }
   }
 
+  private notifyError(message: string, duration: number): void {
+    this.config.notifyError?.(message, { duration });
+  }
+
   /**
    * Get last successful syncDown timestamp from underlying SyncEngine.
    * Returns null if no syncDown has completed yet.
    */
   public getLastSyncDownTimestamp(): string | null {
-    // Access private syncEngine via indexed cast; method is public on engine.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.syncEngine as any).getLastSyncTimestamp?.() ?? null;
+    return this.syncEngine.getLastSyncTimestamp();
   }
 
   /** Return 'incremental' or 'full' based on last syncDown run */
   public getLastSyncMode(): "incremental" | "full" | null {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const engine: any = this.syncEngine as any;
-    if (!engine.getLastSyncTimestamp?.()) return null; // no sync yet
-    const inc = engine.wasLastSyncIncremental?.();
+    if (!this.syncEngine.getLastSyncTimestamp()) return null;
+    const inc = this.syncEngine.wasLastSyncIncremental();
     return inc ? "incremental" : "full";
   }
 
@@ -127,9 +132,7 @@ export class SyncService {
    */
   public async forceFullSyncDown(): Promise<SyncResult> {
     // Clear incremental timestamp so syncDown treats this as cold start.
-    // Access SyncEngine via private field method.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (this.syncEngine as any).clearLastSyncTimestamp?.();
+    this.syncEngine.clearLastSyncTimestamp();
     return await this.syncDown();
   }
 
@@ -379,11 +382,7 @@ export class SyncService {
           }
         }
       }
-
-      // Access SyncEngine private method via index cast (method is public we added).
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const engine: any = this.syncEngine as any;
-      const result: SyncResult = await engine.syncDownTables(tables);
+      const result = await this.syncEngine.syncDownTables(tables);
 
       try {
         await getSyncRuntime().persistDb?.();
@@ -508,11 +507,9 @@ export class SyncService {
 
                 if (shouldToast) {
                   const summary = result.errors[0] ?? "Unknown server error";
-                  toast.error(
+                  this.notifyError(
                     `Sync upload failed (attempt ${this.consecutiveSyncUpFailures}). Your data is still saved locally. ${summary}`,
-                    {
-                      duration: 7000,
-                    }
+                    7000
                   );
                 }
               }
@@ -529,11 +526,9 @@ export class SyncService {
             }
 
             console.error("[SyncService] Error in periodic syncUp:", error);
-            toast.error(
+            this.notifyError(
               "Background sync error. Your changes may not be uploaded.",
-              {
-                duration: 5000,
-              }
+              5000
             );
           } finally {
             periodicSyncUpTickInFlight = false;
@@ -584,11 +579,9 @@ export class SyncService {
               errorMsg.includes("Sync failed: 503");
 
             if (!isNetworkError) {
-              toast.error(
+              this.notifyError(
                 "Failed to sync data from server. You may be seeing outdated data.",
-                {
-                  duration: 5000,
-                }
+                5000
               );
             }
           })
@@ -673,11 +666,9 @@ export class SyncService {
             }
 
             console.error("[SyncService] Initial syncDown failed:", error);
-            toast.error(
+            this.notifyError(
               "Failed to sync data from server on startup. You may be seeing outdated data.",
-              {
-                duration: 8000,
-              }
+              8000
             );
           }
         }

@@ -75,7 +75,8 @@ function formatWithBiome(targetPath: string, content: string): string {
 
 function resolveDrizzleKitBin(): string {
   const binDir = path.join(__dirname, "../../node_modules/.bin");
-  const binName = process.platform === "win32" ? "drizzle-kit.cmd" : "drizzle-kit";
+  const binName =
+    process.platform === "win32" ? "drizzle-kit.cmd" : "drizzle-kit";
   const localBin = path.join(binDir, binName);
   return fs.existsSync(localBin) ? localBin : binName;
 }
@@ -570,6 +571,7 @@ function buildTableMetaTs(params: {
       // Validate uniqueKeys correspond to a UNIQUE constraint (or PK for composite).
       if (core.uniqueKeys) {
         const isCompositePk = Array.isArray(core.primaryKey);
+        const uniqueKeys = core.uniqueKeys;
         const uniqueCandidates = [...uniqueByTableConstraint.entries()]
           .filter(([k]) => k.startsWith(`${tableName}::`))
           .map(([, rows]) =>
@@ -579,8 +581,8 @@ function buildTableMetaTs(params: {
           );
         const matchesUnique = uniqueCandidates.some(
           (cols) =>
-            cols.length === core.uniqueKeys!.length &&
-            cols.every((c, i) => c === core.uniqueKeys![i])
+            cols.length === uniqueKeys.length &&
+            cols.every((c, i) => c === uniqueKeys[i])
         );
 
         if (!matchesUnique) {
@@ -1024,13 +1026,22 @@ function buildTableSyncOrder(params: {
   for (const fk of params.foreignKeys) {
     if (!tableSet.has(fk.table_name) || !tableSet.has(fk.ref_table_name))
       continue;
-    deps.get(fk.table_name)!.add(fk.ref_table_name);
-    reverse.get(fk.ref_table_name)!.add(fk.table_name);
+    const depsForTable = deps.get(fk.table_name);
+    const reverseForTable = reverse.get(fk.ref_table_name);
+    if (!depsForTable || !reverseForTable) {
+      continue;
+    }
+    depsForTable.add(fk.ref_table_name);
+    reverseForTable.add(fk.table_name);
   }
 
   const inDegree = new Map<string, number>();
   for (const t of params.tables) {
-    inDegree.set(t, deps.get(t)!.size);
+    const dependencies = deps.get(t);
+    if (!dependencies) {
+      throw new Error(`Missing dependency set for table: ${t}`);
+    }
+    inDegree.set(t, dependencies.size);
   }
 
   const ready: string[] = params.tables
@@ -1039,7 +1050,10 @@ function buildTableSyncOrder(params: {
 
   const ordered: string[] = [];
   while (ready.length > 0) {
-    const t = ready.shift()!;
+    const t = ready.shift();
+    if (!t) {
+      break;
+    }
     ordered.push(t);
     for (const child of reverse.get(t) ?? []) {
       inDegree.set(child, (inDegree.get(child) ?? 0) - 1);
@@ -1538,8 +1552,40 @@ function buildDefaultWorkerConfig(params: {
 }
 
 function mergeWorkerConfigs(defaults: unknown, overrides: unknown): unknown {
-  const d = (defaults ?? {}) as any;
-  const o = (overrides ?? {}) as any;
+  type NumericCoercion = { prop: string; kind: "int" | "float" };
+  type WorkerConfigRecord = Record<string, unknown>;
+  type WorkerConfigRoot = WorkerConfigRecord & {
+    collections?: WorkerConfigRecord;
+    pull?: {
+      tableRules?: Record<string, unknown>;
+    };
+    push?: {
+      tableRules?: Record<string, unknown>;
+    };
+  };
+  type SanitizeConfig = WorkerConfigRecord & {
+    nullIfEmptyStringProps?: string[];
+    coerceNumericProps?: NumericCoercion[];
+  };
+  type PushTableRuleConfig = WorkerConfigRecord & {
+    sanitize?: SanitizeConfig;
+  };
+
+  const d = (defaults ?? {}) as WorkerConfigRoot;
+  const o = (overrides ?? {}) as WorkerConfigRoot;
+
+  function asRecord(value: unknown): WorkerConfigRecord {
+    return typeof value === "object" && value !== null
+      ? (value as WorkerConfigRecord)
+      : {};
+  }
+
+  function getSanitizeConfig(value: unknown): SanitizeConfig | undefined {
+    if (typeof value !== "object" || value === null) {
+      return undefined;
+    }
+    return value as SanitizeConfig;
+  }
 
   function uniqStrings(values: unknown): string[] {
     if (!Array.isArray(values)) return [];
@@ -1554,7 +1600,6 @@ function mergeWorkerConfigs(defaults: unknown, overrides: unknown): unknown {
     return out;
   }
 
-  type NumericCoercion = { prop: string; kind: "int" | "float" };
   function mergeNumericCoercions(
     base: unknown,
     extra: unknown
@@ -1565,8 +1610,9 @@ function mergeWorkerConfigs(defaults: unknown, overrides: unknown): unknown {
     const seen = new Set<string>();
     for (const v of [...b, ...e]) {
       if (!v || typeof v !== "object") continue;
-      const prop = (v as any).prop;
-      const kind = (v as any).kind;
+      const record = v as WorkerConfigRecord;
+      const prop = record.prop;
+      const kind = record.kind;
       if (typeof prop !== "string") continue;
       if (kind !== "int" && kind !== "float") continue;
       const key = `${prop}::${kind}`;
@@ -1581,13 +1627,13 @@ function mergeWorkerConfigs(defaults: unknown, overrides: unknown): unknown {
     dRules: unknown,
     oRules: unknown
   ): Record<string, unknown> {
-    const dObj = (dRules ?? {}) as Record<string, unknown>;
-    const oObj = (oRules ?? {}) as Record<string, unknown>;
+    const dObj = asRecord(dRules);
+    const oObj = asRecord(oRules);
     const keys = new Set<string>([...Object.keys(dObj), ...Object.keys(oObj)]);
     const out: Record<string, unknown> = {};
     for (const tableName of [...keys].sort((a, b) => a.localeCompare(b))) {
-      const base = (dObj as any)[tableName];
-      const over = (oObj as any)[tableName];
+      const base = dObj[tableName];
+      const over = oObj[tableName];
       if (!base) {
         out[tableName] = over;
         continue;
@@ -1596,9 +1642,11 @@ function mergeWorkerConfigs(defaults: unknown, overrides: unknown): unknown {
         out[tableName] = base;
         continue;
       }
-      const baseSan = (base as any).sanitize;
-      const overSan = (over as any).sanitize;
-      const mergedSanitize =
+      const baseRule = asRecord(base) as PushTableRuleConfig;
+      const overRule = asRecord(over) as PushTableRuleConfig;
+      const baseSan = getSanitizeConfig(baseRule.sanitize);
+      const overSan = getSanitizeConfig(overRule.sanitize);
+      const mergedSanitize: SanitizeConfig | undefined =
         baseSan || overSan
           ? {
               ...(baseSan ?? {}),
@@ -1613,19 +1661,16 @@ function mergeWorkerConfigs(defaults: unknown, overrides: unknown): unknown {
               ),
             }
           : undefined;
-      if (
-        mergedSanitize &&
-        (mergedSanitize as any).nullIfEmptyStringProps?.length === 0
-      ) {
-        delete (mergedSanitize as any).nullIfEmptyStringProps;
+      if (mergedSanitize?.nullIfEmptyStringProps?.length === 0) {
+        mergedSanitize.nullIfEmptyStringProps = undefined;
       }
-      if (mergedSanitize && !(mergedSanitize as any).coerceNumericProps) {
-        delete (mergedSanitize as any).coerceNumericProps;
+      if (mergedSanitize && !mergedSanitize.coerceNumericProps) {
+        mergedSanitize.coerceNumericProps = undefined;
       }
 
       out[tableName] = {
-        ...(base as any),
-        ...(over as any),
+        ...baseRule,
+        ...overRule,
         sanitize: mergedSanitize,
       };
     }

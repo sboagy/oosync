@@ -5,7 +5,7 @@
  * and platform-specific helpers (SQLite, triggers, logger).
  */
 import type { SQLJsDatabase } from "drizzle-orm/sql-js";
-import type { AnySQLiteTable } from "drizzle-orm/sqlite-core";
+import type { AnySQLiteColumn, AnySQLiteTable } from "drizzle-orm/sqlite-core";
 import type { Database as SqlJsDatabase } from "sql.js";
 import type { TableRegistry } from "../shared/table-meta";
 
@@ -39,15 +39,15 @@ export type SyncableTableName = SyncSchemaDescription["syncableTables"][number];
 
 export type SyncPushQueueTable = AnySQLiteTable & {
   // Column accessors used by outbox operations; concrete type comes from consumer schema.
-  id: any;
-  tableName: any;
-  rowId: any;
-  operation: any;
-  status: any;
-  changedAt: any;
-  syncedAt: any;
-  attempts: any;
-  lastError: any;
+  id: AnySQLiteColumn;
+  tableName: AnySQLiteColumn;
+  rowId: AnySQLiteColumn;
+  operation: AnySQLiteColumn;
+  status: AnySQLiteColumn;
+  changedAt: AnySQLiteColumn;
+  syncedAt: AnySQLiteColumn;
+  attempts: AnySQLiteColumn;
+  lastError: AnySQLiteColumn;
 };
 
 export interface SyncRuntime {

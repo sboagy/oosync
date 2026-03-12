@@ -14,14 +14,15 @@
 import type {
   RealtimeChannel,
   RealtimePostgresChangesPayload,
+  SupabaseClient,
 } from "@supabase/supabase-js";
-import type { SupabaseClient } from "@supabase/supabase-js";
 import type { SyncableTable } from "./queue";
 import type { SyncService } from "./service";
 
 // Debug flag for realtime logging
 const REALTIME_DEBUG = import.meta.env.VITE_SYNC_DEBUG === "true";
-const realtimeLog = (...args: any[]) => REALTIME_DEBUG && console.log(...args);
+const realtimeLog = (...args: unknown[]) =>
+  REALTIME_DEBUG && console.log(...args);
 
 export interface RealtimeConfig {
   enabled: boolean;

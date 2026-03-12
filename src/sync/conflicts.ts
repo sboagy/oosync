@@ -41,6 +41,11 @@ export interface ConflictResolution {
   timestamp: string;
 }
 
+type ConflictRecord = Record<string, unknown> & {
+  syncVersion?: number;
+  lastModifiedAt?: string;
+};
+
 /**
  * Detect if a conflict exists between local and remote records
  *
@@ -60,7 +65,10 @@ export interface ConflictResolution {
  * ); // Returns true - different syncVersion
  * ```
  */
-export function detectConflict(localRecord: any, remoteRecord: any): boolean {
+export function detectConflict(
+  localRecord: ConflictRecord,
+  remoteRecord: ConflictRecord
+): boolean {
   // No conflict if both versions match
   if (localRecord.syncVersion === remoteRecord.syncVersion) {
     return false;
@@ -179,16 +187,16 @@ function resolveLastWriteWins(
 export function createConflict(
   tableName: string,
   recordId: string,
-  localRecord: any,
-  remoteRecord: any
+  localRecord: ConflictRecord,
+  remoteRecord: ConflictRecord
 ): SyncConflict {
   return {
     tableName,
     recordId,
-    localVersion: localRecord.syncVersion || 0,
-    remoteVersion: remoteRecord.syncVersion || 0,
-    localTimestamp: localRecord.lastModifiedAt || new Date().toISOString(),
-    remoteTimestamp: remoteRecord.lastModifiedAt || new Date().toISOString(),
+    localVersion: localRecord.syncVersion ?? 0,
+    remoteVersion: remoteRecord.syncVersion ?? 0,
+    localTimestamp: localRecord.lastModifiedAt ?? new Date().toISOString(),
+    remoteTimestamp: remoteRecord.lastModifiedAt ?? new Date().toISOString(),
     localData: localRecord,
     remoteData: remoteRecord,
     detectedAt: new Date().toISOString(),

@@ -8,7 +8,11 @@
  * @module worker/index
  */
 import { and, eq, gt, lte } from "drizzle-orm";
-import type { PgTransaction } from "drizzle-orm/pg-core";
+import type {
+  AnyPgColumn,
+  PgQueryResultHKT,
+  PgTransaction,
+} from "drizzle-orm/pg-core";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import postgres from "postgres";
@@ -18,7 +22,14 @@ import type {
   SyncResponse,
 } from "../../src/shared/protocol";
 import { debug, setDebugEnabled } from "./debug";
-import type { IPushTableRule, SyncSchemaDeps } from "./sync-schema";
+import type {
+  DynamicPgTable,
+  IPushTableRule,
+  PullTableRule,
+  SchemaTables,
+  SyncSchemaDeps,
+  WorkerTransaction,
+} from "./sync-schema";
 import { createSyncSchema } from "./sync-schema";
 
 const CORE_COL_DELETED = "deleted";
@@ -27,8 +38,7 @@ const CORE_COL_LAST_MODIFIED_AT = "last_modified_at";
 type SyncableTableName = string;
 
 export interface WorkerArtifacts extends SyncSchemaDeps {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  schemaTables: Record<string, any>;
+  schemaTables: SchemaTables;
 }
 
 function notInitialized(name: string): never {
@@ -38,8 +48,7 @@ function notInitialized(name: string): never {
   );
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let schemaTables: Record<string, any> | null = null;
+let schemaTables: SchemaTables | null = null;
 let SYNCABLE_TABLES: readonly string[] = [];
 let TABLE_REGISTRY: Record<string, unknown> = {};
 
@@ -53,14 +62,14 @@ let hasDeletedFlag: (tableName: string) => boolean = () =>
   notInitialized("hasDeletedFlag");
 let buildUserFilter: (params: {
   tableName: string;
-  table: any;
+  table: DynamicPgTable;
   userId: string;
   collections: Record<string, Set<string>>;
 }) => unknown[] | null = () => notInitialized("buildUserFilter");
 let loadUserCollections: (params: {
-  tx: PgTransaction<any, any, any>;
+  tx: WorkerTransaction;
   userId: string;
-  tables: Record<string, any>;
+  tables: SchemaTables;
 }) => Promise<Record<string, Set<string>>> = async () =>
   notInitialized("loadUserCollections");
 let minimalPayload: (
@@ -81,13 +90,10 @@ let sanitizeForPush: (params: {
   notInitialized("sanitizeForPush");
 let getPushRule: (tableName: string) => IPushTableRule | undefined = () =>
   notInitialized("getPushRule");
-let getPullRule: (
-  tableName: string
-) => import("./sync-schema").PullTableRule | undefined = () =>
+let getPullRule: (tableName: string) => PullTableRule | undefined = () =>
   notInitialized("getPullRule");
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function getSchemaTables(): Record<string, any> {
+function getSchemaTables(): SchemaTables {
   if (!schemaTables) {
     notInitialized("schemaTables");
   }
@@ -392,12 +398,23 @@ function decodeCursor(raw: string): InitialSyncCursorV1 {
   return { v: 1, tableIndex, offset, syncStartedAt };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type DrizzleTable = any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type DrizzleColumn = any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Transaction = PgTransaction<any, any, any>;
+type DrizzleTable = DynamicPgTable;
+type DrizzleColumn = AnyPgColumn;
+type Transaction = PgTransaction<
+  PgQueryResultHKT,
+  Record<string, unknown>,
+  Record<string, never>
+>;
+
+interface PostgresUnsafeClient {
+  unsafe(query: string, params: unknown[]): Promise<unknown>;
+}
+
+type TransactionWithSession = Transaction & {
+  session?: {
+    client?: PostgresUnsafeClient;
+  };
+};
 
 // ============================================================================
 // UTILITY: Primary Key Helpers
@@ -525,7 +542,7 @@ async function fetchViaRPC(
 
     // Execute using the underlying session (bypassing Drizzle's sql template to avoid array wrapping)
     // Access the postgres-js client through the transaction's internal session
-    const session = (tx as any).session;
+    const session = (tx as TransactionWithSession).session;
     if (!session?.client) {
       throw new Error(
         "Cannot access underlying postgres client from transaction"
@@ -821,20 +838,20 @@ async function applyDelete(
   tx: Transaction,
   tableName: string,
   table: DrizzleTable,
-  primaryKeyCols: { col: unknown; prop: string }[],
-  conflictKeyCols: { col: unknown; prop: string }[],
+  primaryKeyCols: { col: DrizzleColumn; prop: string }[],
+  conflictKeyCols: { col: DrizzleColumn; prop: string }[],
   change: SyncChange
 ): Promise<void> {
   const changeData = change.data as Record<string, unknown>;
 
-  const buildWhere = (cols: { col: unknown; prop: string }[]) => {
+  const buildWhere = (cols: { col: DrizzleColumn; prop: string }[]) => {
     const missing: string[] = [];
     const whereConditions = cols.map((pk) => {
       const value = changeData[pk.prop];
       if (typeof value === "undefined" || value === null) {
         missing.push(pk.prop);
       }
-      return eq(pk.col as any, value as any);
+      return eq(pk.col, value);
     });
     return { whereConditions, missing };
   };
@@ -873,7 +890,7 @@ async function applyDelete(
 async function applyUpsert(
   tx: Transaction,
   table: DrizzleTable,
-  pkCols: { col: unknown; prop: string }[],
+  pkCols: { col: DrizzleColumn; prop: string }[],
   data: Record<string, unknown>,
   opts?: {
     /**
@@ -895,13 +912,10 @@ async function applyUpsert(
     }
   }
 
-  await tx
-    .insert(table)
-    .values(data)
-    .onConflictDoUpdate({
-      target: targetCols as any,
-      set: setData,
-    });
+  await tx.insert(table).values(data).onConflictDoUpdate({
+    target: targetCols,
+    set: setData,
+  });
 }
 
 /**
@@ -1156,15 +1170,23 @@ async function getChangedTables(
   tx: Transaction,
   lastSyncAt: string
 ): Promise<string[]> {
-  const syncChangeLog = getSchemaTables().sync_change_log as any;
+  const syncChangeLog = getSchemaTables().sync_change_log;
+  if (!syncChangeLog) {
+    throw new Error("sync_change_log table not found in worker schema");
+  }
+  const tableNameCol = syncChangeLog.tableName;
+  const changedAtCol = syncChangeLog.changedAt;
+  if (!tableNameCol || !changedAtCol) {
+    throw new Error("sync_change_log is missing required columns");
+  }
   const entries = await tx
     .select({
-      tableName: syncChangeLog.tableName,
+      tableName: tableNameCol,
     })
     .from(syncChangeLog)
-    .where(gt(syncChangeLog.changedAt, lastSyncAt));
+    .where(gt(changedAtCol, lastSyncAt));
 
-  const tables = entries.map((e) => e.tableName);
+  const tables = entries.map((entry) => String(entry.tableName));
   debug.log(
     `[PULL:INCR] Tables changed since ${lastSyncAt}: [${tables.join(", ")}]`
   );
