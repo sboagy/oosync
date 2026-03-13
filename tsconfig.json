@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "baseUrl": ".",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "paths": {
+      "@oosync/shared": ["src/shared/index.ts"],
+      "@oosync/shared/*": ["src/shared/*"],
+      "@oosync/runtime": ["src/runtime/index.ts"],
+      "@oosync/runtime/*": ["src/runtime/*"],
+      "@oosync/sync": ["src/sync/index.ts"],
+      "@oosync/sync/*": ["src/sync/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.d.ts"]
+}

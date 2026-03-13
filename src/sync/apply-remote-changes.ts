@@ -1,8 +1,27 @@
 import type { SyncChange } from "@oosync/shared/protocol";
 import { and, eq } from "drizzle-orm";
+import type { AnySQLiteColumn, AnySQLiteTable } from "drizzle-orm/sqlite-core";
 import { getAdapter, type SyncableTableName } from "./adapters";
 import { toCamelCase } from "./casing";
 import { getSyncRuntime, type SqliteDatabase } from "./runtime-context";
+
+type DynamicSQLiteTable = AnySQLiteTable &
+  Record<string, AnySQLiteColumn | undefined>;
+
+function getTableColumn(
+  table: DynamicSQLiteTable,
+  columnKey: string,
+  tableName: string
+): AnySQLiteColumn | null {
+  const column = table[columnKey];
+  if (!column) {
+    console.warn(
+      `[SyncEngine] Column not found in local schema: ${tableName}.${columnKey}`
+    );
+    return null;
+  }
+  return column;
+}
 
 const isForeignKeyConstraintFailure = (e: unknown): boolean => {
   const msg = e instanceof Error ? e.message : String(e);
@@ -77,8 +96,9 @@ export async function applyRemoteChangesToLocalDb(params: {
       const adapter = getAdapter(change.table as SyncableTableName);
 
       const schemaKey = tableToSchemaKey[change.table] || change.table;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const table = (localSchema as any)[schemaKey];
+      const table = (
+        localSchema as Record<string, DynamicSQLiteTable | undefined>
+      )[schemaKey];
 
       if (!table) {
         logger.warn(
@@ -105,8 +125,8 @@ export async function applyRemoteChangesToLocalDb(params: {
                   );
                   return null;
                 }
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                return eq((table as any)[columnKey], value);
+                const column = getTableColumn(table, columnKey, change.table);
+                return column ? eq(column, value) : null;
               })
               .filter((c): c is ReturnType<typeof eq> => c !== null);
 
@@ -127,11 +147,11 @@ export async function applyRemoteChangesToLocalDb(params: {
               );
               continue;
             }
-            await params.localDb
-              .delete(table)
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              .where(eq((table as any)[columnKey], value))
-              .run();
+            const column = getTableColumn(table, columnKey, change.table);
+            if (!column) {
+              continue;
+            }
+            await params.localDb.delete(table).where(eq(column, value)).run();
           }
         } else {
           // Upsert local
@@ -139,8 +159,25 @@ export async function applyRemoteChangesToLocalDb(params: {
 
           const adapterPk = adapter.primaryKey;
           const conflictTarget = Array.isArray(adapterPk)
-            ? adapterPk.map((k) => (table as any)[toCamelCase(k)])
-            : (table as any)[toCamelCase(adapterPk as string)];
+            ? adapterPk
+                .map((k) => getTableColumn(table, toCamelCase(k), change.table))
+                .filter((column): column is AnySQLiteColumn => column !== null)
+            : getTableColumn(
+                table,
+                toCamelCase(adapterPk as string),
+                change.table
+              );
+
+          if (
+            (Array.isArray(conflictTarget) && conflictTarget.length === 0) ||
+            (!Array.isArray(conflictTarget) && conflictTarget === null)
+          ) {
+            result.failed += 1;
+            result.errors.push(
+              `${change.table}:${change.rowId}: missing conflict target columns`
+            );
+            continue;
+          }
 
           // Some tables have a natural composite unique key (adapter.conflictKeys)
           // in addition to a synthetic PK (id). If we only upsert by id, an insert
@@ -174,13 +211,21 @@ export async function applyRemoteChangesToLocalDb(params: {
                 throw e;
               }
 
+              const compositeTarget = compositeKeys
+                .map((k) => getTableColumn(table, toCamelCase(k), change.table))
+                .filter((column): column is AnySQLiteColumn => column !== null);
+
+              if (compositeTarget.length !== compositeKeys.length) {
+                throw new Error(
+                  `Missing composite conflict target columns for ${change.table}`
+                );
+              }
+
               await params.localDb
                 .insert(table)
                 .values(sanitizedData)
                 .onConflictDoUpdate({
-                  target: compositeKeys.map(
-                    (k) => (table as any)[toCamelCase(k)]
-                  ),
+                  target: compositeTarget,
                   set:
                     compositeKeys.length === 1 && compositeKeys[0] === "id"
                       ? sanitizedData

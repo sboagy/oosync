@@ -10,7 +10,9 @@ describe("sync-core table-specific hack guard", () => {
     ];
     const enginePath = candidates.find((candidate) => existsSync(candidate));
     if (!enginePath) {
-      throw new Error("Unable to locate sync engine source file for guard test");
+      throw new Error(
+        "Unable to locate sync engine source file for guard test"
+      );
     }
 
     const text = readFileSync(enginePath, "utf-8");

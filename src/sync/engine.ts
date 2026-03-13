@@ -11,6 +11,7 @@
 
 import type { SyncChange, SyncRequestOverrides } from "@oosync/shared/protocol";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import type { QueryExecResult } from "sql.js";
 import { getAdapter, type SyncableTableName } from "./adapters";
 import { applyRemoteChangesToLocalDb } from "./apply-remote-changes";
 import {
@@ -96,7 +97,7 @@ const DEFAULT_CONFIG: SyncConfig = {
 };
 
 function sqliteTableHasAnyRows(
-  sqliteInstance: { exec: (sql: string) => any[] },
+  sqliteInstance: { exec: (sql: string) => QueryExecResult[] },
   tableName: string
 ): boolean {
   // Table names are trusted constants from the runtime schema description.
@@ -337,7 +338,7 @@ export class SyncEngine {
           const camelKeys = adapter.toLocal(parsedRowId);
 
           changes.push({
-            table: item.tableName as any,
+            table: item.tableName,
             rowId: item.rowId,
             data: camelKeys,
             deleted: true,
@@ -353,14 +354,17 @@ export class SyncEngine {
           );
 
           if (localRow) {
+            const lastModifiedAt =
+              typeof localRow.lastModifiedAt === "string"
+                ? localRow.lastModifiedAt
+                : item.changedAt;
             // Send camelCase data directly
             changes.push({
-              table: item.tableName as any,
+              table: item.tableName,
               rowId: item.rowId,
               data: localRow,
               deleted: false,
-              lastModifiedAt:
-                (localRow as any).lastModifiedAt || item.changedAt,
+              lastModifiedAt,
             });
             outboxItemsToComplete.push(item);
           } else {
@@ -647,7 +651,9 @@ export class SyncEngine {
         errorMsg.includes("Failed to fetch") ||
         errorMsg.includes("ERR_INTERNET_DISCONNECTED") ||
         errorMsg.includes("NetworkError") ||
-        errorMsg.includes("Timed out while waiting for an open slot in the pool") ||
+        errorMsg.includes(
+          "Timed out while waiting for an open slot in the pool"
+        ) ||
         errorMsg.includes("Sync failed: 503");
       if (!isNetworkError) {
         getLogger().error("[SyncEngine] syncWithWorker failed:", errorMsg);

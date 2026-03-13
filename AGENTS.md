@@ -1,140 +1,80 @@
-# oosync/AGENTS Instructions
+# oosync AGENTS Instructions
 
-Scope: code under `oosync/**` (library + worker implementation) and the **contract** that is generated/consumed by app + worker.
+Scope: repository-wide instructions for the oosync codebase.
 
-Inherits global execution guardrails from `.github/copilot-instructions.md` and repository domain context from root `AGENTS.md`. Do not duplicate global rules here; treat this file as **oosync-specific constraints**.
+Global execution guardrails live in `.github/copilot-instructions.md`. `ARCHITECTURE.md` is the top-level cross-cutting architecture guide for this repository and should be read before making changes that affect codegen, runtime boundaries, public exports, or worker behavior.
 
-## What “oosync” is
+## Instruction Hierarchy
 
-`oosync` = **Opinionated Offline Sync**:
+Root (this file) -> `src/AGENTS.md` (generator, shared contract, runtime, sync engine) -> `worker/AGENTS.md` (generic worker runtime).
 
-- Opinionated PWA sync library for (Supabase, Drizzle, SQLite, Cloudflare Worker)
-- Source of truth is the **local Postgres database** (typically a local Supabase instance during dev)- **Core sync engine** (`oosync/src/sync/`) handles bidirectional sync between local SQLite and Supabase- Provides a code generator that produces:
-  - SQLite WASM + Drizzle schemas
-  - shared sync metadata infrastructure (table registry/meta)
-  - worker-side schema/config artifacts
-  - Postgres migration/support files as needed
-- Once isolated and robust, `oosync` will be extracted into a separate repo and published to npm
+## What oosync Is
 
-## North star (constraints)
+oosync is an opinionated offline sync toolkit for Postgres-backed applications that run against a local SQLite database and synchronize through a worker.
 
-- **Minimize developer work**: changing Postgres should “just work” end-to-end with regeneration.
-- **Prefer generation over hand-authoring**: when possible, infer from Postgres catalogs and defaults.
-- **Defaults-first**: the first “o” is opinionated—assume common-sense defaults.
-- **Overrides exist, but are the exception**: override via config/tags, not manual edits to generated artifacts.
+It owns:
 
-## Dependency & boundary rules (non-negotiable)
+- schema introspection and generated contract production
+- shared protocol and metadata primitives
+- a portable sync runtime for local SQLite workflows
+- a generic worker runtime for push/pull against Postgres
 
-These exist to keep `oosync` future-standalone.
+It does not own consumer UI behavior, consumer schema semantics, or consumer deployment wiring.
 
-### Import direction rules
+## Core Invariants
 
-- `oosync/**` MUST NOT import from app `src/**`.
-- `oosync/src/**` MUST NOT import from `oosync/worker/**` (core/lib cannot depend on Worker runtime).
-- Worker implementation (`oosync/worker/**`) MUST NOT import from app `src/**`.
-- `shared/generated/**` is a **pure generated contract** (types/data/constants only; no app imports).
+1. Schema-agnostic by default. Runtime code must not encode consumer-specific table names, column names, collections, or domain terminology.
+2. Generation over hand-maintenance. If schema-derived output is wrong, fix generator logic or inputs rather than patching generated files.
+3. Consumer-owned artifacts. Generated files belong to the consuming project, not to hand-authored code in this repository.
+4. Layer separation. `src/**` must not depend on `worker/**`; generic worker code must not depend on consumer application code.
+5. Local-database-first runtime. oosync assumes the consumer's live runtime data is local and sync is the transport/reconciliation layer around it.
+6. Strict typing. Avoid `any`; use structural types and narrowing at dynamic boundaries.
+7. Portability. Code should remain suitable for packaging as a standalone npm library.
 
-### Generic implementation rules
+## Repository Stack
 
-oosync must be purely generic. **No application-specific references** of any kind:
+- TypeScript (strict mode)
+- Drizzle ORM
+- postgres-js
+- Cloudflare Worker runtime types
+- jose for JWT verification
+- Biome for lint/format/check
+- Vitest for targeted tests
 
-- ❌ **Hardcoded table names**: `if (tableName === "entity_table")` or `"SELECT * FROM app_link_table"`
-- ❌ **Hardcoded column names**: `record.category`, `entity_table.private_for` (unless from config/contract)
-- ❌ **Hardcoded collection names**: `ctx.collections.selectedItems` (unless from config)
-- ❌ **App-specific concepts in strings**: `"domainFilter"`, `"catalogTable"`, `"activityRecord"`
-- ❌ **Schema assumptions in logic**: Assuming FK relationships, JOIN patterns, or filtering rules
+## Generated Artifact Rules
 
-- ✅ **Config-driven references**: Table/column names from `oosync.codegen.config.json` or generated contract
-- ✅ **Generic type variants**: `PullTableRule` with `kind: "rpc"` (doesn't specify which RPCs exist)
-- ✅ **Parameter mapping**: RPC `params: ["userId", "itemIds"]` where values come from generated config
-- ✅ **Collection registry**: `ctx.collections[collectionName]` where collection names from config
+- Generated outputs are write-only.
+- Do not hand-edit generated artifacts to fix behavior.
+- If a task requires changing generated output shape, update `src/codegen-schema.ts` and validate regeneration/drift behavior.
+- Prefer Postgres catalogs and table comments over manual overrides when new facts can be inferred safely.
 
-**Schema assumptions must be via**:
-1. `oosync.codegen.config.json` (top-level config file)
-2. Generated artifacts in `shared/generated/**` or `worker/src/generated/**`
-3. Postgres table comments (`@oosync.*` tags)
+## Boundary Rules
 
-### Handling boundary violations
+- Do not import consumer application code anywhere in this repository.
+- Do not make `src/**` depend on worker runtime details.
+- Do not hard-code consumer-specific SQL or sync rules in worker logic.
+- Keep shared protocol and metadata layers data-oriented and portable.
 
-If a change forces an import direction that violates the above, stop and redesign around a generated artifact or an interface.
+## Validation Commands
 
-If an existing violation of this rule is found:
-- **If part of current task**: Fix it as part of the work (document in commit message)
-- **If not part of current task**: DO NOT change it directly, but DO report it in the task summary
+- `npm run typecheck`
+- `npm run lint`
+- `npm run check`
+- `npm run test`
 
-### Generated files are write-only (no manual edits)
+Use the smallest relevant set for the change you made, but validate public-surface and architecture changes more broadly.
 
-**CRITICAL**: Generated files (`worker/src/generated/*`, `shared/generated/*`) are **write-only outputs**. Manual edits are **silently wiped** on next `npm run codegen:schema` run.
+## What To Read First
 
-**If a feature requires changes to generated files**:
+- Codegen or output-shape changes: `ARCHITECTURE.md`, then `src/AGENTS.md`, then `src/codegen-schema.ts`.
+- Shared protocol/runtime changes: `ARCHITECTURE.md`, then `src/AGENTS.md`, then the relevant files under `src/shared/**`, `src/runtime/**`, or `src/sync/**`.
+- Worker behavior changes: `ARCHITECTURE.md`, then `worker/AGENTS.md`, then `worker/src/index.ts` and `worker/src/sync-schema.ts`.
 
-1. **STOP and ask the human**: "This feature requires codegen changes to `<file>`. Should I:
-   - Implement codegen support first? (preferred)
-   - Add to `oosync.codegen.config.json` as a manual override?
-   - Defer this feature to a separate PR?"
+## Stop Signs
 
-2. **Never manually edit generated files** - any such edit will be lost on next regeneration
+Pause and ask if:
 
-3. **If codegen must be updated**: Implement the codegen change, regenerate, verify outputs, then continue with feature implementation
-
-**Exception for config-driven overrides**: If the feature can be expressed via `oosync.codegen.config.json` (e.g., `tableRuleOverrides`), add the config entry instead of touching generated files. Config entries survive regeneration.
-
-## Codegen is the source of truth
-
-- Generated files are **write-only** outputs. Do not “fix” generated outputs by editing them.
-- If an output is wrong, fix the generator (`oosync/src/codegen-schema.ts`) or its inputs (Postgres, config, comment tags).
-- Any PR that changes schema/meta should include:
-  - regenerated outputs, and
-  - a drift guard passing check (`tsx oosync/src/codegen-schema.ts --check` via the repo scripts).
-
-### Overrides (preferred mechanisms)
-
-Use these in order:
-
-1. **Postgres catalogs** (PKs, uniques, column types) — default inference.
-2. **Postgres table comments** (lightweight tags):
-   - `@oosync.exclude`
-   - `@oosync.changeCategory=<value>`
-   - `@oosync.normalizeDatetime=col1,col2,...`
-   - `@oosync.ownerColumn=<column_name>`
-3. **`oosync.codegen.config.json`** (consumer-authored):
-   - Prefer `tableMeta.excludeTables` over whitelists.
-   - Avoid legacy `tableMeta.syncableTables` unless absolutely required.
-
-## Syncable tables policy (opinionated default)
-
-- **All application tables are syncable by default** if they have a primary key.
-- Tables are excluded by default if they are:
-  - schema/migration infrastructure (e.g., `schema_migrations`, `drizzle_migrations`)
-  - sync infrastructure/internal tables (e.g., `sync_change_log` and similar)
-  - explicitly excluded via `excludeTables` or `@oosync.exclude`
-
-If we add new internal/sync infrastructure tables in Postgres, they MUST be excluded by default (generator default or config), so consumers don’t accidentally sync them.
-
-## Worker/runtime design constraints
-
-- Worker code should be **artifact-injected**:
-  - The worker receives `syncableTables`, `tableRegistryCore`, and worker config from generated artifacts.
-  - The worker should not hard-code app table names/columns.
-- Avoid introducing coupling to Vite/Solid/browser globals in `oosync/src/**`.
-- Keep types strict (no `any`). If a boundary requires “unknown payload”, use `unknown` and validate/narrow.
-
-## Portability (future npm package)
-
-Assume `oosync` will be its own repo:
-
-- Avoid repo-relative assumptions (paths, scripts) in runtime code.
-- Keep public exports small and stable (`oosync/src/index.ts` as the primary surface).
-- Prefer additive changes to the generated contract; breaking changes require an explicit migration note.
-
-## Local dev notes
-
-- Codegen DB selection prefers `OOSYNC_DATABASE_URL`.
-- `DATABASE_URL` is only used when it clearly points at a local Supabase instance.
-
-## “Stop signs” (when to pause and ask)
-
-- A change would require hand-editing generated artifacts (e.g., `shared/table-meta.ts`).
-- A change would make the worker import app `src/**`.
-- A change would make `oosync/src/**` depend on worker runtime.
-- A proposed feature adds a new manual workflow step for developers instead of an inference/default.
+- the requested fix requires hand-editing generated consumer artifacts
+- the change would introduce consumer-specific logic into oosync runtime code
+- the change would cross the `src/**` -> `worker/**` boundary in the wrong direction
+- the proposed solution adds manual workflow steps where inference or config should be the durable approach
