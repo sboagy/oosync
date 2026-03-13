@@ -1,5 +1,10 @@
 export {};
 
+declare module "*.wasm?url" {
+  const value: string;
+  export default value;
+}
+
 declare global {
   interface ImportMetaEnv {
     readonly VITE_SYNC_DEBUG?: string;

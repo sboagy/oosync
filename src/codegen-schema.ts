@@ -151,9 +151,13 @@ interface ICodegenConfigFile {
     sqliteSchemaFile?: string;
     /** Optional wrapper around the generated SQLite schema with sync runtime tables. */
     sqliteSchemaWrapperFile?: string;
+    /** Optional browser sql.js client wrapper. */
+    sqliteClientFile?: string;
     tableMetaFile?: string;
     /** Generates/overwrites shared/table-meta.ts (consumer-owned). */
     appTableMetaFile?: string;
+    /** Optional app runtime-config wrapper that injects browser SQLite runtime into oosync. */
+    syncRuntimeConfigFile?: string;
     workerPgSchemaFile?: string;
     workerConfigFile?: string;
     /** Optional worker entrypoint that injects generated artifacts into oosync. */
@@ -195,6 +199,27 @@ interface ICodegenConfigFile {
      * This is intentionally opaque to `oosync` itself.
      */
     config?: unknown;
+  };
+  browserSqlite?: {
+    hooksModule: string;
+    hooksExportName?: string;
+    indexedDbName: string;
+    indexedDbStore: string;
+    dbKeyPrefix: string;
+    dbVersionKeyPrefix: string;
+    outboxBackupKeyPrefix: string;
+    lastSyncTimestampKeyPrefix: string;
+    schemaVersion: string;
+    databaseVersion: number;
+    migrationDirectory?: string;
+    migrationFiles?: string[];
+    forceResetQueryParams?: Array<{
+      key: string;
+      value?: string;
+    }>;
+    testApiWindowProperty?: string;
+    clearInProgressWindowProperty?: string;
+    persistWindowHookProperty?: string;
   };
 }
 
@@ -291,6 +316,27 @@ function toImportPath(params: { fromFile: string; toFile: string }): string {
   return withoutExtension.startsWith(".")
     ? withoutExtension
     : `./${withoutExtension}`;
+}
+
+function toAbsoluteFromCwd(filePath: string): string {
+  return path.isAbsolute(filePath)
+    ? filePath
+    : path.join(process.cwd(), filePath);
+}
+
+function toWebAssetPath(filePath: string): string {
+  return `/${path.relative(process.cwd(), filePath).split(path.sep).join("/")}`;
+}
+
+function listSqliteMigrationFiles(directoryPath: string): string[] {
+  if (!fs.existsSync(directoryPath)) {
+    return [];
+  }
+  return fs
+    .readdirSync(directoryPath)
+    .filter((fileName) => fileName.endsWith(".sql"))
+    .sort((left, right) => left.localeCompare(right))
+    .map((fileName) => toWebAssetPath(path.join(directoryPath, fileName)));
 }
 
 function toCamelCase(value: string): string {
@@ -2185,6 +2231,187 @@ function buildWorkerEntrypointTs(params: {
   return lines.join("\n");
 }
 
+function buildSqliteClientTs(params: {
+  schema: string;
+  localSchemaImportPath: string;
+  appTableMetaImportPath: string;
+  hooksImportPath: string;
+  hooksExportName: string;
+  migrationFiles: string[];
+  browserConfig: NonNullable<ICodegenConfigFile["browserSqlite"]>;
+}): string {
+  const lines: string[] = [];
+  lines.push(createHeader({ schema: params.schema }));
+  lines.push(
+    'import type { BrowserSqliteDatabase } from "oosync/runtime/browser-sqlite";'
+  );
+  lines.push(
+    'import { createBrowserSqliteClient } from "oosync/runtime/browser-sqlite";'
+  );
+  lines.push("// eslint-disable-next-line import/no-unresolved");
+  lines.push('import sqlWasmUrl from "sql.js/dist/sql-wasm.wasm?url";');
+  lines.push(
+    `import * as schema from ${JSON.stringify(params.localSchemaImportPath)};`
+  );
+  lines.push(
+    `import { ${params.hooksExportName} } from ${JSON.stringify(params.hooksImportPath)};`
+  );
+  lines.push(
+    `import { SYNCABLE_TABLES, TABLE_REGISTRY, TABLE_SYNC_ORDER, TABLE_TO_SCHEMA_KEY } from ${JSON.stringify(params.appTableMetaImportPath)};`
+  );
+  lines.push("");
+  lines.push("export const browserSqliteClient = createBrowserSqliteClient({");
+  lines.push("  schema,");
+  lines.push("  syncPushQueue: schema.syncPushQueue,");
+  lines.push("  syncSchema: {");
+  lines.push("    syncableTables: SYNCABLE_TABLES,");
+  lines.push("    tableRegistry: TABLE_REGISTRY,");
+  lines.push("    tableSyncOrder: TABLE_SYNC_ORDER,");
+  lines.push("    tableToSchemaKey: TABLE_TO_SCHEMA_KEY,");
+  lines.push("  },");
+  lines.push("  sqlWasmUrl,");
+  lines.push(`  hooks: ${params.hooksExportName},`);
+  lines.push(
+    `  diagnosticsEnabled: import.meta.env.VITE_SYNC_DIAGNOSTICS === "true",`
+  );
+  lines.push("  storage: {");
+  lines.push(
+    `    indexedDbName: ${JSON.stringify(params.browserConfig.indexedDbName)},`
+  );
+  lines.push(
+    `    indexedDbStore: ${JSON.stringify(params.browserConfig.indexedDbStore)},`
+  );
+  lines.push(
+    `    dbKeyPrefix: ${JSON.stringify(params.browserConfig.dbKeyPrefix)},`
+  );
+  lines.push(
+    `    dbVersionKeyPrefix: ${JSON.stringify(params.browserConfig.dbVersionKeyPrefix)},`
+  );
+  lines.push(
+    `    outboxBackupKeyPrefix: ${JSON.stringify(params.browserConfig.outboxBackupKeyPrefix)},`
+  );
+  lines.push(
+    `    lastSyncTimestampKeyPrefix: ${JSON.stringify(params.browserConfig.lastSyncTimestampKeyPrefix)},`
+  );
+  lines.push("  },");
+  lines.push(`  databaseVersion: ${params.browserConfig.databaseVersion},`);
+  lines.push(
+    `  schemaVersion: ${JSON.stringify(params.browserConfig.schemaVersion)},`
+  );
+  lines.push("  migrationFiles: [");
+  for (const migrationFile of params.migrationFiles) {
+    lines.push(`    ${JSON.stringify(migrationFile)},`);
+  }
+  lines.push("  ],");
+  const forceResetParams = params.browserConfig.forceResetQueryParams ?? [];
+  lines.push("  forceResetQueryParams: [");
+  for (const entry of forceResetParams) {
+    if (typeof entry.value === "string") {
+      lines.push(
+        `    { key: ${JSON.stringify(entry.key)}, value: ${JSON.stringify(entry.value)} },`
+      );
+    } else {
+      lines.push(`    { key: ${JSON.stringify(entry.key)} },`);
+    }
+  }
+  lines.push("  ],");
+  lines.push("  testConfig: {");
+  if (params.browserConfig.testApiWindowProperty) {
+    lines.push(
+      `    testApiWindowProperty: ${JSON.stringify(params.browserConfig.testApiWindowProperty)},`
+    );
+  }
+  if (params.browserConfig.clearInProgressWindowProperty) {
+    lines.push(
+      `    clearInProgressWindowProperty: ${JSON.stringify(params.browserConfig.clearInProgressWindowProperty)},`
+    );
+  }
+  if (params.browserConfig.persistWindowHookProperty) {
+    lines.push(
+      `    persistWindowHookProperty: ${JSON.stringify(params.browserConfig.persistWindowHookProperty)},`
+    );
+  }
+  lines.push("  },");
+  lines.push("});");
+  lines.push("");
+  lines.push("export const initializeDb = browserSqliteClient.initializeDb;");
+  lines.push("export const getDb = browserSqliteClient.getDb;");
+  lines.push("export const persistDb = browserSqliteClient.persistDb;");
+  lines.push("export const closeDb = browserSqliteClient.closeDb;");
+  lines.push("export const clearDb = browserSqliteClient.clearDb;");
+  lines.push(
+    "export const setupAutoPersist = browserSqliteClient.setupAutoPersist;"
+  );
+  lines.push(
+    "export const getSqliteInstance = browserSqliteClient.getSqliteInstance;"
+  );
+  lines.push(
+    "export const getSqlJsDebugInfo = browserSqliteClient.getSqlJsDebugInfo;"
+  );
+  lines.push(
+    "export const getClientSqliteDebugState = browserSqliteClient.getDebugState;"
+  );
+  lines.push(
+    "export const loadOutboxBackupForUser = browserSqliteClient.loadOutboxBackupForUser;"
+  );
+  lines.push(
+    "export const clearOutboxBackupForUser = browserSqliteClient.clearOutboxBackupForUser;"
+  );
+  lines.push("");
+  lines.push("export { schema };");
+  lines.push("export type SqliteDatabase = BrowserSqliteDatabase;");
+  lines.push("export type Schema = typeof schema;");
+  lines.push("");
+  return lines.join("\n");
+}
+
+function buildSyncRuntimeConfigTs(params: {
+  schema: string;
+  localSchemaImportPath: string;
+  appTableMetaImportPath: string;
+  clientImportPath: string;
+}): string {
+  const lines: string[] = [];
+  lines.push(createHeader({ schema: params.schema }));
+  lines.push(
+    'import { createBrowserSyncRuntime } from "oosync/runtime/browser-sqlite";'
+  );
+  lines.push(
+    'import { type SyncRuntime, setSyncRuntime } from "@oosync/sync";'
+  );
+  lines.push(
+    `import * as localSchema from ${JSON.stringify(params.localSchemaImportPath)};`
+  );
+  lines.push(
+    `import { browserSqliteClient } from ${JSON.stringify(params.clientImportPath)};`
+  );
+  lines.push(
+    `import { SYNCABLE_TABLES, TABLE_REGISTRY, TABLE_SYNC_ORDER, TABLE_TO_SCHEMA_KEY } from ${JSON.stringify(params.appTableMetaImportPath)};`
+  );
+  lines.push("");
+  lines.push("let configured = false;");
+  lines.push("");
+  lines.push("export function ensureSyncRuntimeConfigured(): void {");
+  lines.push("  if (configured) return;");
+  lines.push("  const runtime: SyncRuntime = createBrowserSyncRuntime({");
+  lines.push("    client: browserSqliteClient,");
+  lines.push("    schema: {");
+  lines.push("      syncableTables: SYNCABLE_TABLES,");
+  lines.push("      tableRegistry: TABLE_REGISTRY,");
+  lines.push("      tableSyncOrder: TABLE_SYNC_ORDER,");
+  lines.push("      tableToSchemaKey: TABLE_TO_SCHEMA_KEY,");
+  lines.push("    },");
+  lines.push("    localSchema,");
+  lines.push("  });");
+  lines.push("  setSyncRuntime(runtime);");
+  lines.push("  configured = true;");
+  lines.push("}");
+  lines.push("");
+  lines.push("ensureSyncRuntimeConfigured();");
+  lines.push("");
+  return lines.join("\n");
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const configPath = resolveConfigPath({ cliPath: args.configPath });
@@ -2200,6 +2427,12 @@ async function main(): Promise<void> {
     ? path.isAbsolute(config.outputs.sqliteSchemaWrapperFile)
       ? config.outputs.sqliteSchemaWrapperFile
       : path.join(process.cwd(), config.outputs.sqliteSchemaWrapperFile)
+    : null;
+
+  const outputSqliteClientFile = config.outputs?.sqliteClientFile
+    ? path.isAbsolute(config.outputs.sqliteClientFile)
+      ? config.outputs.sqliteClientFile
+      : path.join(process.cwd(), config.outputs.sqliteClientFile)
     : null;
 
   const outputTableMetaFile = config.outputs?.tableMetaFile
@@ -2230,6 +2463,12 @@ async function main(): Promise<void> {
     ? path.isAbsolute(config.outputs.workerEntrypointFile)
       ? config.outputs.workerEntrypointFile
       : path.join(process.cwd(), config.outputs.workerEntrypointFile)
+    : null;
+
+  const outputSyncRuntimeConfigFile = config.outputs?.syncRuntimeConfigFile
+    ? path.isAbsolute(config.outputs.syncRuntimeConfigFile)
+      ? config.outputs.syncRuntimeConfigFile
+      : path.join(process.cwd(), config.outputs.syncRuntimeConfigFile)
     : null;
 
   const outputSqliteDrizzleConfig = config.outputs?.sqliteDrizzleConfig
@@ -2443,6 +2682,79 @@ async function main(): Promise<void> {
       )
     : null;
 
+  const browserSqliteConfig = config.browserSqlite;
+  const browserSqliteHooksFile = browserSqliteConfig
+    ? toAbsoluteFromCwd(browserSqliteConfig.hooksModule)
+    : null;
+  const browserSqliteHooksExportName =
+    browserSqliteConfig?.hooksExportName ?? "browserSqliteHooks";
+  const sqliteMigrationDirectory = browserSqliteConfig
+    ? toAbsoluteFromCwd(
+        browserSqliteConfig.migrationDirectory ?? "drizzle/migrations/sqlite"
+      )
+    : null;
+  const sqliteMigrationFiles = browserSqliteConfig?.migrationFiles
+    ? browserSqliteConfig.migrationFiles
+    : sqliteMigrationDirectory
+      ? listSqliteMigrationFiles(sqliteMigrationDirectory)
+      : [];
+
+  if (
+    (outputSqliteClientFile || outputSyncRuntimeConfigFile) &&
+    (!browserSqliteConfig || !browserSqliteHooksFile)
+  ) {
+    throw new Error(
+      "browserSqlite config is required when generating sqliteClientFile or syncRuntimeConfigFile."
+    );
+  }
+
+  const formattedSqliteClient =
+    outputSqliteClientFile && browserSqliteConfig && browserSqliteHooksFile
+      ? formatWithBiome(
+          outputSqliteClientFile,
+          buildSqliteClientTs({
+            schema: args.schema,
+            localSchemaImportPath: toImportPath({
+              fromFile: outputSqliteClientFile,
+              toFile: outputSqliteSchemaWrapperFile ?? outputSchemaFile,
+            }),
+            appTableMetaImportPath: toImportPath({
+              fromFile: outputSqliteClientFile,
+              toFile: outputAppTableMetaFile,
+            }),
+            hooksImportPath: toImportPath({
+              fromFile: outputSqliteClientFile,
+              toFile: browserSqliteHooksFile,
+            }),
+            hooksExportName: browserSqliteHooksExportName,
+            migrationFiles: sqliteMigrationFiles,
+            browserConfig: browserSqliteConfig,
+          })
+        )
+      : null;
+
+  const formattedSyncRuntimeConfig =
+    outputSyncRuntimeConfigFile && outputSqliteClientFile
+      ? formatWithBiome(
+          outputSyncRuntimeConfigFile,
+          buildSyncRuntimeConfigTs({
+            schema: args.schema,
+            localSchemaImportPath: toImportPath({
+              fromFile: outputSyncRuntimeConfigFile,
+              toFile: outputSqliteSchemaWrapperFile ?? outputSchemaFile,
+            }),
+            appTableMetaImportPath: toImportPath({
+              fromFile: outputSyncRuntimeConfigFile,
+              toFile: outputAppTableMetaFile,
+            }),
+            clientImportPath: toImportPath({
+              fromFile: outputSyncRuntimeConfigFile,
+              toFile: outputSqliteClientFile,
+            }),
+          })
+        )
+      : null;
+
   if (args.check) {
     const current = fs.existsSync(outputSchemaFile)
       ? fs.readFileSync(outputSchemaFile, "utf8")
@@ -2516,6 +2828,30 @@ async function main(): Promise<void> {
         );
       }
     }
+
+    if (outputSqliteClientFile && formattedSqliteClient) {
+      const currentSqliteClient = fs.existsSync(outputSqliteClientFile)
+        ? fs.readFileSync(outputSqliteClientFile, "utf8")
+        : "";
+      if (currentSqliteClient !== formattedSqliteClient) {
+        throw new Error(
+          `SQLite client wrapper is out of date. Run: npm run codegen:schema (output: ${outputSqliteClientFile})`
+        );
+      }
+    }
+
+    if (outputSyncRuntimeConfigFile && formattedSyncRuntimeConfig) {
+      const currentSyncRuntimeConfig = fs.existsSync(
+        outputSyncRuntimeConfigFile
+      )
+        ? fs.readFileSync(outputSyncRuntimeConfigFile, "utf8")
+        : "";
+      if (currentSyncRuntimeConfig !== formattedSyncRuntimeConfig) {
+        throw new Error(
+          `Sync runtime config is out of date. Run: npm run codegen:schema (output: ${outputSyncRuntimeConfigFile})`
+        );
+      }
+    }
     // eslint-disable-next-line no-console
     console.log(
       "✅ Schemas + metadata are up to date (via Postgres introspection)."
@@ -2556,6 +2892,22 @@ async function main(): Promise<void> {
     );
   }
 
+  if (outputSqliteClientFile && formattedSqliteClient) {
+    fs.mkdirSync(path.dirname(outputSqliteClientFile), { recursive: true });
+    fs.writeFileSync(outputSqliteClientFile, formattedSqliteClient, "utf8");
+  }
+
+  if (outputSyncRuntimeConfigFile && formattedSyncRuntimeConfig) {
+    fs.mkdirSync(path.dirname(outputSyncRuntimeConfigFile), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      outputSyncRuntimeConfigFile,
+      formattedSyncRuntimeConfig,
+      "utf8"
+    );
+  }
+
   if (outputSqliteDrizzleConfig) {
     runDrizzleKitGenerate(outputSqliteDrizzleConfig);
     // eslint-disable-next-line no-console
@@ -2571,6 +2923,8 @@ async function main(): Promise<void> {
     outputWorkerPgSchemaFile,
     outputWorkerConfigFile,
     outputSqliteSchemaWrapperFile,
+    outputSqliteClientFile,
+    outputSyncRuntimeConfigFile,
     outputWorkerEntrypointFile,
   ].filter((value): value is string => typeof value === "string");
 
