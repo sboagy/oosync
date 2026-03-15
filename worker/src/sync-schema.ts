@@ -1,9 +1,9 @@
 import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type {
-  AnyPgColumn,
-  AnyPgTable,
   PgQueryResultHKT,
+  PgTable,
   PgTransaction,
+  TableConfig,
 } from "drizzle-orm/pg-core";
 
 export type WorkerTransaction = PgTransaction<
@@ -11,8 +11,12 @@ export type WorkerTransaction = PgTransaction<
   Record<string, unknown>,
   Record<string, never>
 >;
-export type DynamicPgTable = AnyPgTable &
-  Record<string, AnyPgColumn | undefined>;
+// PgTable<TableConfig> accepts tables from any schema (public, cubefsrs, etc.).
+// Record<string, any> is needed so column lookups (table[colName]) are accepted
+// by Drizzle's eq/inArray/etc. functions at the call site. The 'any' index
+// signature supersedes PgTable's internal typed properties, giving dynamic access.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type DynamicPgTable = PgTable<TableConfig> & Record<string, any>;
 export type SchemaTables = Record<string, DynamicPgTable | undefined>;
 type FilterCondition = ReturnType<typeof eq>;
 

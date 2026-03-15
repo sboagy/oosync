@@ -2076,12 +2076,24 @@ function buildPgSchemaTs(params: {
     }
   }
 
-  // Generate import statement with only used types (sorted alphabetically)
-  const importTypes = [...Array.from(usedBuilders), "pgTable"].sort();
+  // Generate import statement with only used types (sorted alphabetically).
+  // For non-public schemas, use pgSchema(...).table() so Drizzle qualifies
+  // queries with the correct schema prefix.
+  const isNonPublicSchema = params.schema !== "public";
+  const importTypes = [
+    ...Array.from(usedBuilders),
+    ...(isNonPublicSchema ? ["pgSchema"] : ["pgTable"]),
+  ].sort();
   lines.push(
     `import { ${importTypes.join(", ")} } from "drizzle-orm/pg-core";`
   );
   lines.push("");
+
+  if (isNonPublicSchema) {
+    const schemaVar = `${params.schema}Schema`;
+    lines.push(`const ${schemaVar} = pgSchema("${params.schema}");`);
+    lines.push("");
+  }
 
   for (const tableName of tables) {
     const ident = tableIdentByName.get(tableName);
@@ -2095,7 +2107,10 @@ function buildPgSchemaTs(params: {
     const pkSet = new Set(pkCols.map((r) => r.column_name));
     const isSinglePk = pkCols.length === 1;
 
-    lines.push(`export const ${ident} = pgTable("${tableName}", {`);
+    const tableDecl = isNonPublicSchema
+      ? `${params.schema}Schema.table("${tableName}", {`
+      : `pgTable("${tableName}", {`;
+    lines.push(`export const ${ident} = ${tableDecl}`);
     for (const col of tableColumns) {
       const propName = safeIdentifier(col.column_name);
       const pgType = normalizeType({
