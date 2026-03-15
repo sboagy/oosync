@@ -1459,7 +1459,9 @@ export function createBrowserSqliteClient<
   function getSqlJsDebugInfo(): IBrowserSqliteDebugInfo {
     try {
       const heapView = (
-        sqlJsModule as unknown as { HEAP8?: { buffer?: ArrayBufferLike } } | null
+        sqlJsModule as unknown as {
+          HEAP8?: { buffer?: ArrayBufferLike };
+        } | null
       )?.HEAP8;
       const heapBytes = Number(heapView?.buffer?.byteLength ?? 0);
       return {

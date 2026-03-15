@@ -15,7 +15,7 @@ export type WorkerTransaction = PgTransaction<
 // Record<string, any> is needed so column lookups (table[colName]) are accepted
 // by Drizzle's eq/inArray/etc. functions at the call site. The 'any' index
 // signature supersedes PgTable's internal typed properties, giving dynamic access.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+// biome-ignore lint/suspicious/noExplicitAny: intentional — dynamic Drizzle column access requires any index signature
 export type DynamicPgTable = PgTable<TableConfig> & Record<string, any>;
 export type SchemaTables = Record<string, DynamicPgTable | undefined>;
 type FilterCondition = ReturnType<typeof eq>;
