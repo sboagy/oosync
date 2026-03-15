@@ -2079,10 +2079,13 @@ function buildPgSchemaTs(params: {
   // Generate import statement with only used types (sorted alphabetically).
   // For non-public schemas, use pgSchema(...).table() so Drizzle qualifies
   // queries with the correct schema prefix.
+  // pgTable is always needed for public-schema infrastructure tables
+  // (sync_change_log) even when the app schema is non-public.
   const isNonPublicSchema = params.schema !== "public";
   const importTypes = [
     ...Array.from(usedBuilders),
-    ...(isNonPublicSchema ? ["pgSchema"] : ["pgTable"]),
+    "pgTable",
+    ...(isNonPublicSchema ? ["pgSchema"] : []),
   ].sort();
   lines.push(
     `import { ${importTypes.join(", ")} } from "drizzle-orm/pg-core";`
@@ -2154,11 +2157,29 @@ function buildPgSchemaTs(params: {
     lines.push("");
   }
 
+  // For non-public schemas, always emit the public-schema sync infrastructure
+  // table so the worker can resolve getSchemaTables().sync_change_log.
+  if (isNonPublicSchema) {
+    lines.push(
+      `// sync infrastructure table (public schema — required by oosync worker)`
+    );
+    lines.push(`export const syncChangeLog = pgTable("sync_change_log", {`);
+    lines.push(`  tableName: text("table_name").notNull().primaryKey(),`);
+    lines.push(`  changedAt: text("changed_at").notNull(),`);
+    lines.push(`});`);
+    lines.push("");
+  }
+
   lines.push("export const tables = {");
   for (const tableName of tables) {
     const ident = tableIdentByName.get(tableName);
     if (!ident) continue;
     lines.push(`  ${JSON.stringify(tableName)}: ${ident},`);
+  }
+  // Always include the public-schema sync infrastructure table so the worker
+  // can resolve getSchemaTables().sync_change_log regardless of app schema.
+  if (isNonPublicSchema) {
+    lines.push(`  "sync_change_log": syncChangeLog,`);
   }
   lines.push("} as const;");
   lines.push("");
