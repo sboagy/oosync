@@ -199,9 +199,13 @@ export async function applyRemoteChangesToLocalDb(params: {
                 .run();
             } catch (e) {
               const errorMsg = e instanceof Error ? e.message : String(e);
+              // Use `some` instead of `every` so that partial unique indexes
+              // (e.g. `CREATE UNIQUE INDEX ... WHERE user_id IS NULL`) also
+              // trigger this fallback.  A partial index produces an error
+              // mentioning only the indexed columns, not all composite keys.
               const isCompositeUniqueViolation =
                 errorMsg.includes("UNIQUE constraint failed:") &&
-                compositeKeys.every(
+                compositeKeys.some(
                   (k) =>
                     errorMsg.includes(`${change.table}.${k}`) ||
                     errorMsg.includes(k)
