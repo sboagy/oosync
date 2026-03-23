@@ -2084,7 +2084,9 @@ function buildPgSchemaTs(params: {
   const importTypes = [
     ...Array.from(usedBuilders),
     ...(isNonPublicSchema ? ["PgSchema", "pgSchema"] : ["pgTable"]),
-  ].sort();
+  ].sort((left, right) =>
+    left.localeCompare(right, undefined, { sensitivity: "base" })
+  );
   lines.push(
     `import { ${importTypes.join(", ")} } from "drizzle-orm/pg-core";`
   );
@@ -2291,10 +2293,10 @@ function buildSqliteClientTs(params: {
     `import * as schema from ${JSON.stringify(params.localSchemaImportPath)};`
   );
   lines.push(
-    `import { ${params.hooksExportName} } from ${JSON.stringify(params.hooksImportPath)};`
+    `import { SYNCABLE_TABLES, TABLE_REGISTRY, TABLE_SYNC_ORDER, TABLE_TO_SCHEMA_KEY } from ${JSON.stringify(params.appTableMetaImportPath)};`
   );
   lines.push(
-    `import { SYNCABLE_TABLES, TABLE_REGISTRY, TABLE_SYNC_ORDER, TABLE_TO_SCHEMA_KEY } from ${JSON.stringify(params.appTableMetaImportPath)};`
+    `import { ${params.hooksExportName} } from ${JSON.stringify(params.hooksImportPath)};`
   );
   lines.push("");
   lines.push("export const browserSqliteClient = createBrowserSqliteClient({");
@@ -2411,10 +2413,10 @@ function buildSyncRuntimeConfigTs(params: {
   const lines: string[] = [];
   lines.push(createHeader({ schema: params.schema }));
   lines.push(
-    'import { createBrowserSyncRuntime } from "oosync/runtime/browser-sqlite";'
+    'import { type SyncRuntime, setSyncRuntime as setAliasedSyncRuntime } from "@oosync/sync";'
   );
   lines.push(
-    'import { type SyncRuntime, setSyncRuntime as setAliasedSyncRuntime } from "@oosync/sync";'
+    'import { createBrowserSyncRuntime } from "oosync/runtime/browser-sqlite";'
   );
   lines.push(
     'import { setSyncRuntime as setPackageSyncRuntime } from "oosync/sync";'
@@ -2423,10 +2425,10 @@ function buildSyncRuntimeConfigTs(params: {
     `import * as localSchema from ${JSON.stringify(params.localSchemaImportPath)};`
   );
   lines.push(
-    `import { browserSqliteClient } from ${JSON.stringify(params.clientImportPath)};`
+    `import { SYNCABLE_TABLES, TABLE_REGISTRY, TABLE_SYNC_ORDER, TABLE_TO_SCHEMA_KEY } from ${JSON.stringify(params.appTableMetaImportPath)};`
   );
   lines.push(
-    `import { SYNCABLE_TABLES, TABLE_REGISTRY, TABLE_SYNC_ORDER, TABLE_TO_SCHEMA_KEY } from ${JSON.stringify(params.appTableMetaImportPath)};`
+    `import { browserSqliteClient } from ${JSON.stringify(params.clientImportPath)};`
   );
   lines.push("");
   lines.push("let configured = false;");
