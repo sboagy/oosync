@@ -2078,14 +2078,12 @@ function buildPgSchemaTs(params: {
 
   // Generate import statement with only used types (sorted alphabetically).
   // For non-public schemas, use pgSchema(...).table() so Drizzle qualifies
-  // queries with the correct schema prefix.
-  // pgTable is always needed for public-schema infrastructure tables
-  // (sync_change_log) even when the app schema is non-public.
+  // queries with the correct schema prefix, including the public-schema
+  // sync_change_log infrastructure table.
   const isNonPublicSchema = params.schema !== "public";
   const importTypes = [
     ...Array.from(usedBuilders),
-    "pgTable",
-    ...(isNonPublicSchema ? ["pgSchema"] : []),
+    ...(isNonPublicSchema ? ["PgSchema", "pgSchema"] : ["pgTable"]),
   ].sort();
   lines.push(
     `import { ${importTypes.join(", ")} } from "drizzle-orm/pg-core";`
@@ -2095,6 +2093,7 @@ function buildPgSchemaTs(params: {
   if (isNonPublicSchema) {
     const schemaVar = `${params.schema}Schema`;
     lines.push(`const ${schemaVar} = pgSchema("${params.schema}");`);
+    lines.push(`const publicSchema = new PgSchema("public");`);
     lines.push("");
   }
 
@@ -2163,7 +2162,9 @@ function buildPgSchemaTs(params: {
     lines.push(
       `// sync infrastructure table (public schema — required by oosync worker)`
     );
-    lines.push(`export const syncChangeLog = pgTable("sync_change_log", {`);
+    lines.push(
+      `export const syncChangeLog = publicSchema.table("sync_change_log", {`
+    );
     lines.push(`  tableName: text("table_name").notNull().primaryKey(),`);
     lines.push(`  changedAt: text("changed_at").notNull(),`);
     lines.push(`});`);
@@ -2413,7 +2414,10 @@ function buildSyncRuntimeConfigTs(params: {
     'import { createBrowserSyncRuntime } from "oosync/runtime/browser-sqlite";'
   );
   lines.push(
-    'import { type SyncRuntime, setSyncRuntime } from "@oosync/sync";'
+    'import { type SyncRuntime, setSyncRuntime as setAliasedSyncRuntime } from "@oosync/sync";'
+  );
+  lines.push(
+    'import { setSyncRuntime as setPackageSyncRuntime } from "oosync/sync";'
   );
   lines.push(
     `import * as localSchema from ${JSON.stringify(params.localSchemaImportPath)};`
@@ -2439,7 +2443,8 @@ function buildSyncRuntimeConfigTs(params: {
   lines.push("    },");
   lines.push("    localSchema,");
   lines.push("  });");
-  lines.push("  setSyncRuntime(runtime);");
+  lines.push("  setAliasedSyncRuntime(runtime);");
+  lines.push("  setPackageSyncRuntime(runtime);");
   lines.push("  configured = true;");
   lines.push("}");
   lines.push("");
