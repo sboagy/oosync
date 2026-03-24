@@ -303,7 +303,13 @@ export class SyncService {
             `[SyncService] ⚠️  BLOCKING syncDown: ${stats.pending} pending changes must upload first`
           );
           try {
-            await this.syncEngine.syncUpFromOutbox();
+            const uploadResult = await this.syncEngine.syncUpFromOutbox();
+            if (!uploadResult.success) {
+              throw new Error(
+                uploadResult.errors[0] ??
+                  "Pending local changes could not be uploaded"
+              );
+            }
             console.log(
               "[SyncService] ✅ Pending changes uploaded - safe to syncDown"
             );
@@ -367,7 +373,13 @@ export class SyncService {
             `[SyncService] ⚠️  BLOCKING scoped syncDown: ${stats.pending} pending changes must upload first`
           );
           try {
-            await this.syncEngine.syncUpFromOutbox();
+            const uploadResult = await this.syncEngine.syncUpFromOutbox();
+            if (!uploadResult.success) {
+              throw new Error(
+                uploadResult.errors[0] ??
+                  "Pending local changes could not be uploaded"
+              );
+            }
             console.log(
               "[SyncService] ✅ Pending changes uploaded - scoped syncDown safe"
             );
@@ -629,7 +641,13 @@ export class SyncService {
             console.log(
               `[SyncService] Running initial syncDown (attempt ${attempt}/${maxAttempts})...`
             );
-            await this.syncDown();
+            const result = await this.syncDown();
+            if (!result.success) {
+              throw new Error(
+                result.errors[0] ??
+                  "Initial syncDown returned an unsuccessful result"
+              );
+            }
             initialSyncDownCompleted = true;
             startPeriodicSyncTimers();
             console.log(
