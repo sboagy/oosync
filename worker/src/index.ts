@@ -328,7 +328,7 @@ export interface Env {
   /** When "true", ignores HYPERDRIVE and connects via DATABASE_URL directly. */
   BYPASS_HYPERDRIVE?: string;
   SUPABASE_URL: string;
-  SUPABASE_JWT_SECRET: string;
+  SUPABASE_JWT_SECRET?: string;
   /** When "true", enables debug logging (console.log statements). */
   WORKER_DEBUG?: string;
   /** When "true", emits perf timing logs for sync phases. */
@@ -683,7 +683,7 @@ function getJwks(supabaseUrl: string): ReturnType<typeof createRemoteJWKSet> {
 
 async function verifyJwt(
   request: Request,
-  secret: string,
+  secret: string | undefined,
   supabaseUrl: string
 ): Promise<string | null> {
   const authHeader = request.headers.get("Authorization");
@@ -710,6 +710,12 @@ async function verifyJwt(
       payload = result.payload;
     } else {
       // HS256 (Supabase CLI < 2.75): symmetric secret
+      if (!secret) {
+        console.error(
+          "[AUTH] HS256 token received but SUPABASE_JWT_SECRET is not configured"
+        );
+        return null;
+      }
       debug.log("[AUTH] Using HS256 verification");
       const result = await jwtVerify(token, new TextEncoder().encode(secret));
       payload = result.payload;
@@ -1592,12 +1598,6 @@ async function fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "POST" && url.pathname === "/api/sync") {
       debug.log(`[HTTP] POST /api/sync received`);
       perfLog(perfDebugEnabled, "http.sync.request.received");
-
-      // Validate environment configuration
-      if (!env.SUPABASE_JWT_SECRET) {
-        console.error("[HTTP] SUPABASE_JWT_SECRET not configured");
-        return errorResponse("Server configuration error", 500, corsHeaders);
-      }
 
       // Authenticate
       const authStartedAt = Date.now();

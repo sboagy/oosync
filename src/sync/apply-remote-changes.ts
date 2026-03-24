@@ -28,14 +28,29 @@ const isForeignKeyConstraintFailure = (e: unknown): boolean => {
   return /FOREIGN KEY constraint failed/i.test(msg);
 };
 
-const sanitizeData = (data: Record<string, unknown>) => {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+export const sanitizeDataForSqliteBinding = (
+  data: Record<string, unknown>
+) => {
   const sanitized = { ...data };
-  // Convert boolean to integer for SQLite
+
+  // Convert JS values to types sql.js can bind safely.
   for (const key in sanitized) {
     if (typeof sanitized[key] === "boolean") {
       sanitized[key] = sanitized[key] ? 1 : 0;
+      continue;
+    }
+
+    if (Array.isArray(sanitized[key]) || isPlainObject(sanitized[key])) {
+      sanitized[key] = JSON.stringify(sanitized[key]);
     }
   }
+
   return sanitized;
 };
 
@@ -155,7 +170,7 @@ export async function applyRemoteChangesToLocalDb(params: {
           }
         } else {
           // Upsert local
-          const sanitizedData = sanitizeData(change.data);
+          const sanitizedData = sanitizeDataForSqliteBinding(change.data);
 
           const adapterPk = adapter.primaryKey;
           const conflictTarget = Array.isArray(adapterPk)
