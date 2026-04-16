@@ -61,6 +61,9 @@ function getRuntimeState() {
 // Diagnostics flag for collecting sync performance stats (set VITE_SYNC_DIAGNOSTICS=true).
 const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
 
+const INITIAL_SYNC_PAGE_SIZE = 200;
+const MIN_INITIAL_SYNC_PAGE_SIZE = 25;
+
 /** LocalStorage key prefix for persisting last sync timestamp across app restarts */
 const LAST_SYNC_TIMESTAMP_KEY_PREFIX = "TT_LAST_SYNC_TIMESTAMP";
 
@@ -125,6 +128,34 @@ async function hasAnyLocalSyncData(): Promise<boolean> {
   }
 
   return false;
+}
+
+function isRetriableInitialSyncPageError(error: unknown): boolean {
+  const errorMsg = error instanceof Error ? error.message : String(error);
+  return (
+    errorMsg.includes("Failed to fetch") ||
+    errorMsg.includes("ERR_INTERNET_DISCONNECTED") ||
+    errorMsg.includes("NetworkError") ||
+    errorMsg.includes("Timed out while waiting for an open slot in the pool") ||
+    errorMsg.includes("Sync failed: 503")
+  );
+}
+
+function getInitialSyncPageSizeFallbacks(startPageSize: number): number[] {
+  const pageSizes = [startPageSize];
+  let currentPageSize = startPageSize;
+
+  while (currentPageSize > MIN_INITIAL_SYNC_PAGE_SIZE) {
+    currentPageSize = Math.max(
+      MIN_INITIAL_SYNC_PAGE_SIZE,
+      Math.floor(currentPageSize / 2)
+    );
+    if (!pageSizes.includes(currentPageSize)) {
+      pageSizes.push(currentPageSize);
+    }
+  }
+
+  return pageSizes;
 }
 
 /**
@@ -246,6 +277,72 @@ export class SyncEngine {
         affectedTables: [],
       };
     }
+  }
+
+  private async pullInitialSyncPageWithFallback(params: {
+    workerClient: WorkerClient;
+    changes: SyncChange[];
+    lastSyncAt?: string;
+    pullCursor?: string;
+    syncStartedAt?: string;
+    requestOverrides?: SyncRequestOverrides | null;
+    pageSize: number;
+  }): Promise<{
+    response: Awaited<ReturnType<WorkerClient["sync"]>>;
+    pageSize: number;
+  }> {
+    const {
+      workerClient,
+      changes,
+      lastSyncAt,
+      pullCursor,
+      syncStartedAt,
+      requestOverrides,
+      pageSize,
+    } = params;
+
+    const pageSizes = getInitialSyncPageSizeFallbacks(pageSize);
+    let lastError: unknown;
+
+    for (let index = 0; index < pageSizes.length; index += 1) {
+      const candidatePageSize = pageSizes[index];
+
+      try {
+        const response = await workerClient.sync(changes, lastSyncAt, {
+          pullCursor,
+          syncStartedAt,
+          pageSize: candidatePageSize,
+          overrides: requestOverrides ?? undefined,
+        });
+
+        if (candidatePageSize !== pageSize) {
+          getLogger().warn(
+            `[SyncEngine] Initial sync page recovered after reducing pageSize from ${pageSize} to ${candidatePageSize}`
+          );
+        }
+
+        return { response, pageSize: candidatePageSize };
+      } catch (error) {
+        lastError = error;
+        const canRetry =
+          index < pageSizes.length - 1 &&
+          isRetriableInitialSyncPageError(error);
+
+        if (!canRetry) {
+          throw error;
+        }
+
+        const nextPageSize = pageSizes[index + 1];
+        getLogger().warn(
+          `[SyncEngine] Initial sync page failed with pageSize=${candidatePageSize}; retrying with pageSize=${nextPageSize}`,
+          error
+        );
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Initial sync page failed without an error");
   }
 
   /**
@@ -419,6 +516,7 @@ export class SyncEngine {
       };
       let pullCursor: string | undefined;
       let syncStartedAt: string | undefined;
+      let initialSyncPageSize = INITIAL_SYNC_PAGE_SIZE;
 
       const diagStartedAtMs = SYNC_DIAGNOSTICS ? performance.now() : 0;
       let diagPullPages = 0;
@@ -434,14 +532,29 @@ export class SyncEngine {
       }
 
       // 3. Call Worker (Push + first Pull page)
-      const firstResponse = await workerClient.sync(
-        changes,
-        this.lastSyncTimestamp || undefined,
-        {
-          pageSize: 200,
-          overrides: requestOverrides ?? undefined,
-        }
-      );
+      const firstPageResult = isInitialSync
+        ? await this.pullInitialSyncPageWithFallback({
+            workerClient,
+            changes,
+            lastSyncAt: this.lastSyncTimestamp || undefined,
+            requestOverrides,
+            pageSize: initialSyncPageSize,
+          })
+        : null;
+      const firstResponse = firstPageResult
+        ? firstPageResult.response
+        : await workerClient.sync(
+            changes,
+            this.lastSyncTimestamp || undefined,
+            {
+              pageSize: INITIAL_SYNC_PAGE_SIZE,
+              overrides: requestOverrides ?? undefined,
+            }
+          );
+
+      if (firstPageResult) {
+        initialSyncPageSize = firstPageResult.pageSize;
+      }
 
       if (SYNC_DIAGNOSTICS) {
         diagPullPages += 1;
@@ -480,12 +593,16 @@ export class SyncEngine {
       // 6. If initial sync is paginated, pull remaining pages (no push)
       if (isInitialSync && pullCursor) {
         while (pullCursor) {
-          const pageResponse = await workerClient.sync([], undefined, {
+          const pageResult = await this.pullInitialSyncPageWithFallback({
+            workerClient,
+            changes: [],
             pullCursor,
             syncStartedAt,
-            pageSize: 200,
-            overrides: requestOverrides ?? undefined,
+            requestOverrides,
+            pageSize: initialSyncPageSize,
           });
+          const pageResponse = pageResult.response;
+          initialSyncPageSize = pageResult.pageSize;
 
           pullCursor = pageResponse.nextCursor;
           syncStartedAt = pageResponse.syncStartedAt ?? syncStartedAt;
