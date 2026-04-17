@@ -53,3 +53,12 @@ Repository architecture and layer ownership live in `ARCHITECTURE.md` and the ro
 - **Keep Architecture Docs Current:** If a task changes architecture, sync boundaries, codegen outputs, runtime wiring, or repository responsibilities, read `ARCHITECTURE.md` before editing and update it in the same change unless the architecture document remains accurate without modification.
 - Do not revert unrelated user changes.
 - If an existing boundary violation is outside the current task, leave it in place and call it out in the summary instead of broadening scope.
+
+## 6. Multi-Repo Agentic Workflow
+
+### 1. Unified Knowledge Access
+* **Global Memory Path:** Always utilize the Memory MCP server, if it is available.
+
+### 2. Orchestration Rules
+* **Sequential Thinking:** Mandatory for any task that spans repo boundaries (e.g., changing a schema in oosync and updating the migration in the App).
+* **Dependency Law:** Always trace patterns from the implementation repo (`oosync`) to the usage repo (`App`) using the `relation` tool.
