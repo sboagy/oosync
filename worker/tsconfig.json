@@ -8,18 +8,7 @@
     "skipLibCheck": true,
     "strict": true,
     "allowImportingTsExtensions": true,
-    "noEmit": true,
-    "ignoreDeprecations": "6.0",
-    "baseUrl": "../..",
-    "paths": {
-      "@shared-generated/*": ["shared/generated/*"],
-      "@sync-schema/*": ["shared/sync-schema/*"]
-    }
+    "noEmit": true
   },
-  "include": [
-    "src/**/*",
-    "../src/shared/**/*.ts",
-    "../../shared/generated/**/*",
-    "../../shared/sync-schema/**/*"
-  ]
+  "include": ["src/**/*", "../src/shared/**/*.ts"]
 }
