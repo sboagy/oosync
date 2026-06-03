@@ -151,7 +151,7 @@ interface ICodegenConfigFile {
     sqliteSchemaFile?: string;
     /** Optional wrapper around the generated SQLite schema with sync runtime tables. */
     sqliteSchemaWrapperFile?: string;
-    /** Optional browser sql.js client wrapper. */
+    /** Optional browser SQLite WASM client wrapper. */
     sqliteClientFile?: string;
     tableMetaFile?: string;
     /** Generates/overwrites shared/table-meta.ts (consumer-owned). */
@@ -2287,8 +2287,6 @@ function buildSqliteClientTs(params: {
   lines.push(
     'import { createBrowserSqliteClient } from "oosync/runtime/browser-sqlite";'
   );
-  lines.push("// eslint-disable-next-line import/no-unresolved");
-  lines.push('import sqlWasmUrl from "sql.js/dist/sql-wasm.wasm?url";');
   lines.push(
     `import * as schema from ${JSON.stringify(params.localSchemaImportPath)};`
   );
@@ -2308,7 +2306,6 @@ function buildSqliteClientTs(params: {
   lines.push("    tableSyncOrder: TABLE_SYNC_ORDER,");
   lines.push("    tableToSchemaKey: TABLE_TO_SCHEMA_KEY,");
   lines.push("  },");
-  lines.push("  sqlWasmUrl,");
   lines.push(`  hooks: ${params.hooksExportName},`);
   lines.push(
     `  diagnosticsEnabled: import.meta.env.VITE_SYNC_DIAGNOSTICS === "true",`
@@ -2385,7 +2382,7 @@ function buildSqliteClientTs(params: {
     "export const getSqliteInstance = browserSqliteClient.getSqliteInstance;"
   );
   lines.push(
-    "export const getSqlJsDebugInfo = browserSqliteClient.getSqlJsDebugInfo;"
+    "export const getSqliteDebugInfo = browserSqliteClient.getSqliteDebugInfo;"
   );
   lines.push(
     "export const getClientSqliteDebugState = browserSqliteClient.getDebugState;"

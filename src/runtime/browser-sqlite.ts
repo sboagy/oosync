@@ -1,6 +1,4 @@
 import { drizzle } from "drizzle-orm/sql-js";
-import type { Database as SqlJsDatabase, SqlJsStatic } from "sql.js";
-import initSqlJs from "sql.js";
 import type {
   IOutboxBackup,
   IOutboxBackupItem,
@@ -10,15 +8,18 @@ import type {
   SyncSchemaDescription,
 } from "../sync/runtime-context";
 import type { ILogger } from "./platform/types";
+import {
+  createSqliteWasmDatabase,
+  initSqliteWasm,
+  type ISqliteWasmDebugInfo,
+} from "./sqlite-wasm-adapter";
 
 export type { IOutboxBackup, SqliteRawDatabase } from "../sync/runtime-context";
 
 export type BrowserSqliteDatabase = ReturnType<typeof drizzle>;
+type SqliteWasmModule = Awaited<ReturnType<typeof initSqliteWasm>>;
 
-export interface IBrowserSqliteDebugInfo {
-  hasModule: boolean;
-  wasmHeapBytes?: number;
-}
+export type IBrowserSqliteDebugInfo = ISqliteWasmDebugInfo;
 
 export interface IClientSqliteDebugState {
   initEpoch: number;
@@ -53,7 +54,7 @@ export interface IBrowserSqliteTestConfig {
 
 export interface IBrowserSqliteHookContext {
   phase: "loaded" | "created";
-  rawDb: SqlJsDatabase;
+  rawDb: SqliteRawDatabase;
   userId: string;
 }
 
@@ -79,7 +80,6 @@ export interface IBrowserSqliteClientConfig<
   schema: Schema;
   syncSchema: SyncSchemaDescription;
   syncPushQueue: SyncPushQueueTable;
-  sqlWasmUrl: string;
   storage: IBrowserSqliteStorageConfig;
   databaseVersion: number;
   schemaVersion: string;
@@ -100,7 +100,7 @@ export interface IBrowserSqliteClient<Schema extends Record<string, unknown>> {
   clearDb: () => Promise<void>;
   setupAutoPersist: () => () => void;
   getSqliteInstance: () => Promise<SqliteRawDatabase | null>;
-  getSqlJsDebugInfo: () => IBrowserSqliteDebugInfo;
+  getSqliteDebugInfo: () => IBrowserSqliteDebugInfo;
   getDebugState: () => IClientSqliteDebugState;
   loadOutboxBackupForUser: (userId: string) => Promise<IOutboxBackup | null>;
   clearOutboxBackupForUser: (userId: string) => Promise<void>;
@@ -332,7 +332,10 @@ function parseRowIdToPkObject(
   return { [primaryKeyColumn]: rowId };
 }
 
-function getExistingColumns(db: SqlJsDatabase, tableName: string): Set<string> {
+function getExistingColumns(
+  db: SqliteRawDatabase,
+  tableName: string
+): Set<string> {
   const stmt = db.prepare(`PRAGMA table_info("${tableName}")`);
   const columns = new Set<string>();
   try {
@@ -350,7 +353,7 @@ function getExistingColumns(db: SqlJsDatabase, tableName: string): Set<string> {
 }
 
 function selectRowByPk(
-  db: SqlJsDatabase,
+  db: SqliteRawDatabase,
   tableName: string,
   pk: Record<string, unknown>
 ): Record<string, unknown> | null {
@@ -383,7 +386,7 @@ function filterRowDataToExistingColumns(
 }
 
 function createOutboxBackup(
-  db: SqlJsDatabase,
+  db: SqliteRawDatabase,
   syncSchema: SyncSchemaDescription
 ): IOutboxBackup {
   const createdAt = new Date().toISOString();
@@ -449,7 +452,7 @@ function createOutboxBackup(
 }
 
 function replayOutboxBackup(
-  db: SqlJsDatabase,
+  db: SqliteRawDatabase,
   syncSchema: SyncSchemaDescription,
   backup: IOutboxBackup
 ): { applied: number; skipped: number; errors: string[] } {
@@ -571,7 +574,7 @@ function getTriggerConfigs(
   });
 }
 
-function createSyncTriggerControlTable(db: SqlJsDatabase): void {
+function createSyncTriggerControlTable(db: SqliteRawDatabase): void {
   db.run(`
     CREATE TABLE IF NOT EXISTS sync_trigger_control (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -583,7 +586,7 @@ function createSyncTriggerControlTable(db: SqlJsDatabase): void {
   `);
 }
 
-function createSyncPushQueueTable(db: SqlJsDatabase): void {
+function createSyncPushQueueTable(db: SqliteRawDatabase): void {
   db.run(`
     CREATE TABLE IF NOT EXISTS sync_push_queue (
       id TEXT PRIMARY KEY NOT NULL,
@@ -631,7 +634,7 @@ function generatePkWhereClause(
 }
 
 function createTriggersForTable(
-  db: SqlJsDatabase,
+  db: SqliteRawDatabase,
   config: ITableTriggerConfig
 ): void {
   const { tableName, primaryKey, supportsIncremental } = config;
@@ -708,7 +711,7 @@ function createTriggersForTable(
 }
 
 function installSyncTriggers(
-  db: SqlJsDatabase,
+  db: SqliteRawDatabase,
   syncSchema: SyncSchemaDescription,
   logger: ILogger
 ): void {
@@ -721,11 +724,11 @@ function installSyncTriggers(
   }
 }
 
-function suppressSyncTriggers(db: SqlJsDatabase): void {
+function suppressSyncTriggers(db: SqliteRawDatabase): void {
   db.run(`UPDATE sync_trigger_control SET disabled = 1 WHERE id = 1`);
 }
 
-function enableSyncTriggers(db: SqlJsDatabase): void {
+function enableSyncTriggers(db: SqliteRawDatabase): void {
   db.run(`UPDATE sync_trigger_control SET disabled = 0 WHERE id = 1`);
 }
 
@@ -894,7 +897,7 @@ async function clearSyncableTablesForMigration(
 }
 
 export function ensureColumnExists(
-  db: SqlJsDatabase,
+  db: SqliteRawDatabase,
   table: string,
   column: string,
   definition: string,
@@ -915,18 +918,15 @@ export function ensureColumnExists(
 export function createBrowserSqliteClient<
   Schema extends Record<string, unknown>,
 >(config: IBrowserSqliteClientConfig<Schema>): IBrowserSqliteClient<Schema> {
-  let sqliteDb: SqlJsDatabase | null = null;
+  let sqliteDb: SqliteRawDatabase | null = null;
   let drizzleDb: BrowserSqliteDatabase | null = null;
   let dbReady = false;
   let isClearing = false;
   let isInitializingDb = false;
   let clearDbPromise: Promise<void> | null = null;
   let initEpoch = 0;
-  let sqlJsInitPromise: Promise<SqlJsStatic> | null = null;
-  let sqlJsModule: SqlJsStatic | null = null;
-  let sqlJsInitAttempts = 0;
-  const sqlJsMaxRetries = 3;
-  let cachedWasmBinary: ArrayBuffer | null = null;
+  let sqliteWasmInitPromise: Promise<SqliteWasmModule> | null = null;
+  let sqliteWasmModule: SqliteWasmModule | null = null;
   let initializeDbPromise: Promise<BrowserSqliteDatabase> | null = null;
   let currentUserId: string | null = null;
   let e2ePersistCount = 0;
@@ -946,56 +946,23 @@ export function createBrowserSqliteClient<
   const getOutboxBackupKey = (userId: string): string =>
     `${config.storage.outboxBackupKeyPrefix}-${userId}`;
 
-  async function getSqlJs(): Promise<SqlJsStatic> {
-    if (sqlJsModule) return sqlJsModule;
-    if (sqlJsInitPromise) return sqlJsInitPromise;
+  async function getSqliteWasm(): Promise<SqliteWasmModule> {
+    if (sqliteWasmModule) return sqliteWasmModule;
+    if (sqliteWasmInitPromise) return sqliteWasmInitPromise;
 
-    sqlJsInitAttempts += 1;
-    diagLog("initSqlJs attempt", sqlJsInitAttempts);
-    if (!cachedWasmBinary) {
-      try {
-        const response = await fetch(config.sqlWasmUrl, { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error(
-            `Failed to fetch sql.js wasm binary ${response.status}`
-          );
-        }
-        cachedWasmBinary = await response.arrayBuffer();
-      } catch (error) {
-        logger.warn("Failed to prefetch sql.js wasm binary", error);
-      }
-    }
-
-    sqlJsInitPromise = initSqlJs({
-      locateFile: (file) => {
-        if (file === "sql-wasm.wasm") return config.sqlWasmUrl;
-        return `/sql-wasm/${file}`;
-      },
-      wasmBinary: cachedWasmBinary || undefined,
-    })
+    diagLog("sqlite-wasm init attempt");
+    sqliteWasmInitPromise = initSqliteWasm()
       .then((module) => {
-        sqlJsModule = module;
+        sqliteWasmModule = module;
         return module;
       })
       .catch((error: unknown) => {
-        logger.error("sql.js init failed", error);
-        sqlJsInitPromise = null;
-        const message = error instanceof Error ? error.message : String(error);
-        if (
-          sqlJsInitAttempts < sqlJsMaxRetries &&
-          /callback is no longer runnable/i.test(message)
-        ) {
-          logger.warn("Retrying sql.js init after callback error...");
-          return new Promise<SqlJsStatic>((resolve, reject) => {
-            setTimeout(() => {
-              getSqlJs().then(resolve).catch(reject);
-            }, 50);
-          });
-        }
+        logger.error("sqlite-wasm init failed", error);
+        sqliteWasmInitPromise = null;
         throw error;
       });
 
-    return await sqlJsInitPromise;
+    return await sqliteWasmInitPromise;
   }
 
   async function saveOutboxBackupForUser(
@@ -1041,7 +1008,7 @@ export function createBrowserSqliteClient<
 
   async function backupPendingOutboxBestEffort(
     userId: string,
-    db: SqlJsDatabase
+    db: SqliteRawDatabase
   ): Promise<void> {
     try {
       await clearOutboxBackupForUser(userId);
@@ -1117,10 +1084,10 @@ export function createBrowserSqliteClient<
     isInitializingDb = true;
     initializeDbPromise = (async () => {
       try {
-        const SQL = await getSqlJs();
+        const sqlite3 = await getSqliteWasm();
         ensureNotCleared();
 
-        const requireSqliteDb = (): SqlJsDatabase => {
+        const requireSqliteDb = (): SqliteRawDatabase => {
           ensureNotCleared();
           if (!sqliteDb) {
             throw new Error(
@@ -1168,9 +1135,11 @@ export function createBrowserSqliteClient<
 
         let phase: "loaded" | "created" = "created";
         if (existingData && storedVersionNum === config.databaseVersion) {
-          sqliteDb = new SQL.Database(existingData);
+          sqliteDb = createSqliteWasmDatabase(sqlite3, existingData);
           phase = "loaded";
-          drizzleDb = drizzle(sqliteDb, { schema: { ...config.schema } });
+          drizzleDb = drizzle(sqliteDb as never, {
+            schema: { ...config.schema },
+          });
           if (config.hooks.onExistingDatabaseLoaded) {
             await config.hooks.onExistingDatabaseLoaded(drizzleDb, {
               phase,
@@ -1180,13 +1149,6 @@ export function createBrowserSqliteClient<
           }
         } else {
           if (existingData) {
-            try {
-              const oldDb = new SQL.Database(existingData);
-              await backupPendingOutboxBestEffort(userId, oldDb);
-              oldDb.close();
-            } catch (error) {
-              logger.warn("Failed to inspect old DB for outbox backup", error);
-            }
             await deleteFromIndexedDB(
               config.storage.indexedDbName,
               config.storage.indexedDbStore,
@@ -1200,7 +1162,7 @@ export function createBrowserSqliteClient<
           }
 
           clearLastSyncTimestampForUser(config.storage, userId, logger);
-          sqliteDb = new SQL.Database();
+          sqliteDb = createSqliteWasmDatabase(sqlite3);
 
           for (const migrationPath of config.migrationFiles) {
             const response = await fetch(migrationPath, { cache: "no-store" });
@@ -1221,7 +1183,7 @@ export function createBrowserSqliteClient<
             }
           }
 
-          drizzleDb = drizzle(requireSqliteDb(), {
+          drizzleDb = drizzle(requireSqliteDb() as never, {
             schema: { ...config.schema },
           });
         }
@@ -1456,21 +1418,11 @@ export function createBrowserSqliteClient<
     return sqliteDb;
   }
 
-  function getSqlJsDebugInfo(): IBrowserSqliteDebugInfo {
-    try {
-      const heapView = (
-        sqlJsModule as unknown as {
-          HEAP8?: { buffer?: ArrayBufferLike };
-        } | null
-      )?.HEAP8;
-      const heapBytes = Number(heapView?.buffer?.byteLength ?? 0);
-      return {
-        hasModule: !!sqlJsModule,
-        wasmHeapBytes: heapBytes > 0 ? heapBytes : undefined,
-      };
-    } catch {
-      return { hasModule: !!sqlJsModule };
-    }
+  function getSqliteDebugInfo(): IBrowserSqliteDebugInfo {
+    return {
+      hasModule: !!sqliteWasmModule,
+      version: sqliteWasmModule?.version.libVersion,
+    };
   }
 
   function getDebugState(): IClientSqliteDebugState {
@@ -1495,7 +1447,7 @@ export function createBrowserSqliteClient<
     clearDb,
     setupAutoPersist,
     getSqliteInstance,
-    getSqlJsDebugInfo,
+    getSqliteDebugInfo,
     getDebugState,
     loadOutboxBackupForUser,
     clearOutboxBackupForUser,
