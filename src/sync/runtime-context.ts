@@ -4,8 +4,9 @@
  * Consumers must provide schema metadata, sync infrastructure tables,
  * and platform-specific helpers (SQLite, triggers, logger).
  */
-import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core/db";
+
 import type { AnySQLiteColumn, AnySQLiteTable } from "drizzle-orm/sqlite-core";
+import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core/db";
 import type { IRawSqliteDatabase } from "../runtime/sqlite-wasm-adapter";
 import type { TableRegistry } from "../shared/table-meta";
 
@@ -21,7 +22,7 @@ export type SqliteRawDatabase = IRawSqliteDatabase;
 export interface IOutboxBackupItem {
   tableName: SyncableTableName;
   rowId: string;
-  operation: "INSERT" | "UPDATE" | "DELETE" | string;
+  operation: "INSERT" | "UPDATE" | "DELETE";
   changedAt: string;
   rowData?: Record<string, unknown>;
 }

@@ -10,8 +10,8 @@ import type {
 import type { ILogger } from "./platform/types";
 import {
   createSqliteWasmDatabase,
-  initSqliteWasm,
   type ISqliteWasmDebugInfo,
+  initSqliteWasm,
 } from "./sqlite-wasm-adapter";
 
 export type { IOutboxBackup, SqliteRawDatabase } from "../sync/runtime-context";
@@ -72,6 +72,7 @@ export interface IBrowserSqliteHooks {
     db: BrowserSqliteDatabase,
     context: { userId: string }
   ) => Promise<void> | void;
+  onDatabaseClosed?: () => void;
 }
 
 export interface IBrowserSqliteClientConfig<
@@ -385,6 +386,20 @@ function filterRowDataToExistingColumns(
   return filtered;
 }
 
+function normalizeQueueOperation(
+  operation: string
+): IOutboxBackupItem["operation"] | null {
+  const normalized = operation.toUpperCase();
+  if (
+    normalized === "INSERT" ||
+    normalized === "UPDATE" ||
+    normalized === "DELETE"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
 function createOutboxBackup(
   db: SqliteRawDatabase,
   syncSchema: SyncSchemaDescription
@@ -419,14 +434,19 @@ function createOutboxBackup(
         continue;
       }
 
+      const normalizedOperation = normalizeQueueOperation(operation);
+      if (!normalizedOperation) {
+        continue;
+      }
+
       const item: IOutboxBackupItem = {
         tableName,
         rowId,
-        operation,
+        operation: normalizedOperation,
         changedAt,
       };
 
-      if (operation.toLowerCase() !== "delete") {
+      if (normalizedOperation !== "DELETE") {
         try {
           const pk = parseRowIdToPkObject(syncSchema, tableName, rowId);
           const rowData = selectRowByPk(db, tableName, pk);
@@ -870,6 +890,23 @@ async function deleteFromIndexedDB(
   });
 }
 
+function decodeDatabaseVersion(bytes: Uint8Array | null): number {
+  if (!bytes || bytes.length === 0) return 0;
+  if (bytes.length >= 4) {
+    return new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+  }
+  return bytes[0] ?? 0;
+}
+
+function encodeDatabaseVersion(version: number): Uint8Array {
+  if (!Number.isInteger(version) || version < 0 || version > 0xffffffff) {
+    throw new Error(`Invalid browser SQLite databaseVersion: ${version}`);
+  }
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, version, true);
+  return bytes;
+}
+
 async function clearSyncableTablesForMigration(
   db: BrowserSqliteDatabase,
   syncSchema: SyncSchemaDescription,
@@ -903,6 +940,7 @@ export function ensureColumnExists(
   definition: string,
   logger?: ILogger
 ): void {
+  const shouldRethrow = /\bnot\s+null\b/i.test(definition);
   try {
     const result = db.exec(`PRAGMA table_info(${table})`);
     const values = result[0]?.values ?? [];
@@ -912,6 +950,9 @@ export function ensureColumnExists(
     db.run(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
   } catch (error) {
     logger?.error?.(`Failed to ensure column ${table}.${column}`, error);
+    if (shouldRethrow) {
+      throw error;
+    }
   }
 }
 
@@ -945,6 +986,17 @@ export function createBrowserSqliteClient<
     `${config.storage.dbVersionKeyPrefix}-${userId}`;
   const getOutboxBackupKey = (userId: string): string =>
     `${config.storage.outboxBackupKeyPrefix}-${userId}`;
+
+  function closeSqliteDb(): void {
+    if (!sqliteDb) return;
+    const dbToClose = sqliteDb;
+    sqliteDb = null;
+    try {
+      dbToClose.close();
+    } finally {
+      config.hooks.onDatabaseClosed?.();
+    }
+  }
 
   async function getSqliteWasm(): Promise<SqliteWasmModule> {
     if (sqliteWasmModule) return sqliteWasmModule;
@@ -1011,9 +1063,11 @@ export function createBrowserSqliteClient<
     db: SqliteRawDatabase
   ): Promise<void> {
     try {
-      await clearOutboxBackupForUser(userId);
       const backup = createOutboxBackup(db, config.syncSchema);
-      if (backup.items.length === 0) return;
+      if (backup.items.length === 0) {
+        await clearOutboxBackupForUser(userId);
+        return;
+      }
       await saveOutboxBackupForUser(userId, backup);
       diagLog(`Backed up ${backup.items.length} outbox item(s) for replay`);
     } catch (error) {
@@ -1065,8 +1119,7 @@ export function createBrowserSqliteClient<
         logger.warn("Failed to persist previous user's DB", error);
       }
       if (sqliteDb) {
-        sqliteDb.close();
-        sqliteDb = null;
+        closeSqliteDb();
       }
       drizzleDb = null;
       dbReady = false;
@@ -1130,8 +1183,7 @@ export function createBrowserSqliteClient<
           dbVersionKey
         );
         ensureNotCleared();
-        const storedVersionNum =
-          storedVersion && storedVersion.length > 0 ? storedVersion[0] : 0;
+        const storedVersionNum = decodeDatabaseVersion(storedVersion);
 
         let phase: "loaded" | "created" = "created";
         if (existingData && storedVersionNum === config.databaseVersion) {
@@ -1182,6 +1234,7 @@ export function createBrowserSqliteClient<
               }
             }
           }
+          requireSqliteDb().run("PRAGMA foreign_keys = ON");
 
           drizzleDb = drizzle(requireSqliteDb() as never, {
             schema: { ...config.schema },
@@ -1251,6 +1304,14 @@ export function createBrowserSqliteClient<
           logger.error("initializeDb failed", error);
         }
         initializeDbPromise = null;
+        if (!dbReady) {
+          try {
+            closeSqliteDb();
+          } catch {
+            // ignore cleanup errors while preserving the original init failure
+          }
+          drizzleDb = null;
+        }
         throw error;
       }
     })();
@@ -1259,11 +1320,10 @@ export function createBrowserSqliteClient<
       isInitializingDb = false;
       if (initEpoch !== myInitEpoch && drizzleDb) {
         try {
-          sqliteDb?.close();
+          closeSqliteDb();
         } catch {
           // ignore cleanup errors after cancellation
         }
-        sqliteDb = null;
         drizzleDb = null;
         dbReady = false;
         initializeDbPromise = null;
@@ -1319,7 +1379,7 @@ export function createBrowserSqliteClient<
       config.storage.indexedDbName,
       config.storage.indexedDbStore,
       getDbVersionKey(currentUserId),
-      new Uint8Array([config.databaseVersion])
+      encodeDatabaseVersion(config.databaseVersion)
     );
   }
 
@@ -1334,8 +1394,7 @@ export function createBrowserSqliteClient<
       }
     }
     if (sqliteDb) {
-      sqliteDb.close();
-      sqliteDb = null;
+      closeSqliteDb();
     }
     drizzleDb = null;
     currentUserId = null;
@@ -1354,8 +1413,7 @@ export function createBrowserSqliteClient<
 
     clearDbPromise = (async () => {
       if (sqliteDb) {
-        sqliteDb.close();
-        sqliteDb = null;
+        closeSqliteDb();
         drizzleDb = null;
         e2ePersistCount = 0;
         e2eCumulativeExportBytes = 0;
