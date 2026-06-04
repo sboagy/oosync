@@ -2290,6 +2290,21 @@ function buildIndexItems(params: {
   return configItems;
 }
 
+function hasEmittableIndexItems(
+  groupedIndexes: Map<string, IIndexKeyRow[]>,
+  tableNames: string[]
+): boolean {
+  return tableNames.some((tableName) =>
+    getGroupedRowsForTable(groupedIndexes, tableName).some((rows) => {
+      const sorted = getSortedRowsByPosition(rows);
+      return (
+        !!sorted[0]?.index_name &&
+        sorted.every((row) => parseIndexKeyToColumnName(row.keydef) !== null)
+      );
+    })
+  );
+}
+
 function buildSqliteConfigItems(params: {
   tableName: string;
   pkCols: IConstraintColumnRow[];
@@ -2386,9 +2401,19 @@ function buildSchemaTs(params: {
     params.strict
   );
 
+  const sqliteCoreImports = [
+    ...(hasEmittableIndexItems(idxByTableIndex, tables) ? ["index"] : []),
+    "integer",
+    "primaryKey",
+    "real",
+    "sqliteTable",
+    "text",
+    "uniqueIndex",
+  ].join(", ");
+
   return [
     createHeader({ schema: params.schema }),
-    'import { integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";',
+    `import { ${sqliteCoreImports} } from "drizzle-orm/sqlite-core";`,
     'import { sqliteSyncColumns } from "oosync/shared/sync-columns";',
     "",
     ...tables.flatMap((tableName) => {
