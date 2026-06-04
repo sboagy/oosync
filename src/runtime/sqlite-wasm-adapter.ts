@@ -89,8 +89,8 @@ function normalizeResultValue(value: unknown): SqliteCompatibleValue {
     return value;
   }
   if (typeof value === "boolean") return Number(value);
-  if (typeof value === "undefined") return null;
-  return String(value);
+  if (value === undefined) return null;
+  return JSON.stringify(value);
 }
 
 function normalizeRow(row: unknown[]): SqliteCompatibleValue[] {
@@ -145,7 +145,7 @@ class SqliteWasmStatementAdapter implements IRawSqliteStatement {
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): SqliteCompatibleValue[] {
     bindIfProvided(this.statement, params);
-    return normalizeRow(this.statement.get([]) as unknown[]);
+    return normalizeRow(this.statement.get([]));
   }
 
   getAsObject(
