@@ -1807,7 +1807,7 @@ function buildSchemaTs(params: {
   lines.push(createHeader({ schema: params.schema }));
 
   const sqliteCoreImport =
-    'import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";';
+    'import { integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";';
   lines.push(sqliteCoreImport);
 
   lines.push('import { sqliteSyncColumns } from "oosync/shared/sync-columns";');

@@ -145,19 +145,13 @@ class SqliteWasmStatementAdapter implements IRawSqliteStatement {
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): SqliteCompatibleValue[] {
     bindIfProvided(this.statement, params);
-    if (!params || this.statement.step()) {
-      return normalizeRow(this.statement.get([]) as unknown[]);
-    }
-    return [];
+    return normalizeRow(this.statement.get([]) as unknown[]);
   }
 
   getAsObject(
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): Record<string, SqliteCompatibleValue> {
     bindIfProvided(this.statement, params);
-    if (params && !this.statement.step()) {
-      return {};
-    }
     const row = this.statement.get({}) as Record<string, unknown>;
     return Object.fromEntries(
       Object.entries(row).map(([key, value]) => [
