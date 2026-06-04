@@ -4,20 +4,25 @@
  * Consumers must provide schema metadata, sync infrastructure tables,
  * and platform-specific helpers (SQLite, triggers, logger).
  */
-import type { SQLJsDatabase } from "drizzle-orm/sql-js";
+
 import type { AnySQLiteColumn, AnySQLiteTable } from "drizzle-orm/sqlite-core";
-import type { Database as SqlJsDatabase } from "sql.js";
+import type { BaseSQLiteDatabase } from "drizzle-orm/sqlite-core/db";
+import type { IRawSqliteDatabase } from "../runtime/sqlite-wasm-adapter";
 import type { TableRegistry } from "../shared/table-meta";
 
-/** Drizzle SQL.js database (typed queries/select/insert/update). */
-export type SqliteDatabase = SQLJsDatabase<Record<string, unknown>>;
-/** Raw sql.js Database instance (provides exec/run, used for triggers/maintenance). */
-export type SqliteRawDatabase = SqlJsDatabase;
+/** Drizzle SQLite database (typed queries/select/insert/update). */
+export type SqliteDatabase = BaseSQLiteDatabase<
+  "sync",
+  void,
+  Record<string, unknown>
+>;
+/** Raw SQLite instance (provides exec/run, used for triggers/maintenance). */
+export type SqliteRawDatabase = IRawSqliteDatabase;
 
 export interface IOutboxBackupItem {
   tableName: SyncableTableName;
   rowId: string;
-  operation: "INSERT" | "UPDATE" | "DELETE" | string;
+  operation: "INSERT" | "UPDATE" | "DELETE";
   changedAt: string;
   rowData?: Record<string, unknown>;
 }

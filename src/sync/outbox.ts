@@ -373,7 +373,7 @@ export async function getOutboxStats(db: SqliteDatabase): Promise<{
   // IMPORTANT: Don't fetch all outbox rows into JS.
   // The outbox can grow large (especially when offline), and selecting all rows
   // will allocate a huge array and can crash the tab.
-  // Also keep this to a single SQL statement to minimize sql.js statement churn.
+  // Also keep this to a single SQL statement to minimize raw SQLite statement churn.
   const rows = await db.all(sql`
     SELECT
       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,

@@ -52,14 +52,11 @@ declare module "@supabase/supabase-js" {
 }
 
 declare module "sql.js" {
-  export interface SqlJsInitConfig {
-    locateFile?: (file: string) => string;
-    wasmBinary?: ArrayBuffer;
-  }
-
   export interface Statement {
+    run(values?: unknown): void;
     bind(values?: unknown): boolean;
     step(): boolean;
+    get(params?: unknown): unknown[];
     getAsObject(params?: unknown): Record<string, unknown>;
     free(): void;
   }
@@ -76,15 +73,4 @@ declare module "sql.js" {
     export(): Uint8Array;
     close(): void;
   }
-
-  export interface SqlJsStatic {
-    Database: new (data?: Uint8Array | ArrayBuffer) => Database;
-    HEAP8?: {
-      buffer?: ArrayBufferLike;
-    };
-  }
-
-  export default function initSqlJs(
-    config?: SqlJsInitConfig
-  ): Promise<SqlJsStatic>;
 }

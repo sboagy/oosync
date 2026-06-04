@@ -34,12 +34,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-export const sanitizeDataForSqliteBinding = (
-  data: Record<string, unknown>
-) => {
+export const sanitizeDataForSqliteBinding = (data: Record<string, unknown>) => {
   const sanitized = { ...data };
 
-  // Convert JS values to types sql.js can bind safely.
+  // Convert JS values to types the raw SQLite adapter can bind safely.
   for (const key in sanitized) {
     if (typeof sanitized[key] === "boolean") {
       sanitized[key] = sanitized[key] ? 1 : 0;

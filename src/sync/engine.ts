@@ -11,7 +11,7 @@
 
 import type { SyncChange, SyncRequestOverrides } from "@oosync/shared/protocol";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { QueryExecResult } from "sql.js";
+import type { IRawSqliteExecResult } from "../runtime/sqlite-wasm-adapter";
 import { getAdapter, type SyncableTableName } from "./adapters";
 import { applyRemoteChangesToLocalDb } from "./apply-remote-changes";
 import {
@@ -100,7 +100,7 @@ const DEFAULT_CONFIG: SyncConfig = {
 };
 
 function sqliteTableHasAnyRows(
-  sqliteInstance: { exec: (sql: string) => QueryExecResult[] },
+  sqliteInstance: { exec: (sql: string) => IRawSqliteExecResult[] },
   tableName: string
 ): boolean {
   // Table names are trusted constants from the runtime schema description.
@@ -114,7 +114,7 @@ function sqliteTableHasAnyRows(
 async function hasAnyLocalSyncData(): Promise<boolean> {
   const { getSqliteInstance, syncableTables } = getRuntimeState();
   const sqliteInstance = await getSqliteInstance();
-  // If sql.js isn't initialized yet, we cannot reliably inspect the DB.
+  // If SQLite isn't initialized yet, we cannot reliably inspect the DB.
   // In the specific scenario where we have a persisted lastSyncTimestamp but the
   // local DB was cleared/reset (common in E2E), treating this as "has data"
   // causes us to incorrectly do an incremental sync against an empty DB.
