@@ -60,6 +60,17 @@ describe("sqlite-wasm adapter", () => {
     expect(select.step()).toBe(false);
     select.free();
 
+    const getWithoutStep = db.prepare(
+      "SELECT id, n FROM item WHERE id = ? LIMIT 1"
+    );
+    expect(getWithoutStep.get(["a"])).toEqual(["a", 1]);
+    expect(getWithoutStep.getAsObject(["c"])).toEqual({
+      id: "c",
+      n: 3,
+    });
+    expect(getWithoutStep.get(["missing"])).toEqual([]);
+    getWithoutStep.free();
+
     expect(db.exec("SELECT COUNT(*) AS total FROM item")[0]?.values).toEqual([
       [3],
     ]);

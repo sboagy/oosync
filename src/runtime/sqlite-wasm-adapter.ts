@@ -117,6 +117,7 @@ function bindIfProvided(
 
 class SqliteWasmStatementAdapter implements IRawSqliteStatement {
   private readonly statement: Sqlite3PreparedStatement;
+  private hasCurrentRow = false;
 
   constructor(statement: Sqlite3PreparedStatement) {
     this.statement = statement;
@@ -125,33 +126,56 @@ class SqliteWasmStatementAdapter implements IRawSqliteStatement {
   run(
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): void {
+    this.statement.reset(true);
     bindIfProvided(this.statement, params);
     this.statement.step();
     this.statement.reset(true);
+    this.hasCurrentRow = false;
   }
 
   bind(
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): boolean {
+    this.statement.reset(true);
     bindIfProvided(this.statement, params);
+    this.hasCurrentRow = false;
     return true;
   }
 
   step(): boolean {
-    return this.statement.step();
+    this.hasCurrentRow = this.statement.step();
+    return this.hasCurrentRow;
+  }
+
+  private stepIfNeeded(
+    params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
+  ): boolean {
+    if (params) {
+      this.statement.reset(true);
+      bindIfProvided(this.statement, params);
+      this.hasCurrentRow = false;
+    }
+    if (!this.hasCurrentRow) {
+      this.hasCurrentRow = this.statement.step();
+    }
+    return this.hasCurrentRow;
   }
 
   get(
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): SqliteCompatibleValue[] {
-    bindIfProvided(this.statement, params);
+    if (!this.stepIfNeeded(params)) {
+      return [];
+    }
     return normalizeRow(this.statement.get([]));
   }
 
   getAsObject(
     params?: SqliteCompatibleValue[] | Record<string, SqliteCompatibleValue>
   ): Record<string, SqliteCompatibleValue> {
-    bindIfProvided(this.statement, params);
+    if (!this.stepIfNeeded(params)) {
+      return {};
+    }
     const row = this.statement.get({}) as Record<string, unknown>;
     return Object.fromEntries(
       Object.entries(row).map(([key, value]) => [
