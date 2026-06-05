@@ -8,7 +8,7 @@
  * @module lib/sync/outbox
  */
 
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, sql } from "drizzle-orm";
 import type { AnySQLiteTable } from "drizzle-orm/sqlite-core";
 import { getPrimaryKey } from "../shared/table-meta";
 import { toCamelCase } from "./casing";
@@ -44,6 +44,14 @@ function getDrizzleTableFromSchema(
   const schemaKey = tableToSchemaKey[tableName];
   if (!schemaKey) return undefined;
   return (localSchema as Record<string, AnySQLiteTable>)[schemaKey];
+}
+
+function hasDrizzleColumn(tableName: string, columnName: string): boolean {
+  const table = getDrizzleTableFromSchema(tableName);
+  if (!table) return false;
+  return Object.values(getTableColumns(table)).some(
+    (column) => column.name === columnName
+  );
 }
 
 function randomHexId(bytesLength = 16): string {
@@ -165,6 +173,11 @@ export async function backfillOutboxForTable(
   // When applying remote changes during syncDown, we suppress triggers. Any rows written in
   // that window will have their remote device_id (or null). We only want to backfill rows
   // written by THIS device while triggers were suppressed (e.g., user edits).
+  const hasDeviceIdColumn = hasDrizzleColumn(tableName, "device_id");
+  if (deviceId && !hasDeviceIdColumn) {
+    return 0;
+  }
+
   const deviceClause = deviceId ? ` AND "device_id" = '${deviceId}'` : "";
 
   const query = sql.raw(

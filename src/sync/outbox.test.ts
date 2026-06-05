@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { sqliteTable, text } from "drizzle-orm/sqlite-core";
 import {
+  backfillOutboxForTable,
   clearOldOutboxItems,
   fetchLocalRowByPrimaryKey,
   getDrizzleTable,
@@ -41,6 +43,53 @@ function configureTestRuntime(): void {
     },
     syncPushQueue: queueColumns,
     localSchema: { entityTable: { name: "entity_table" } },
+    getSqliteInstance: async () => null,
+    loadOutboxBackupForUser: async () => null,
+    clearOutboxBackupForUser: async () => {},
+    replayOutboxBackup: () => ({ applied: 0, skipped: 0, errors: [] }),
+    enableSyncTriggers: () => {},
+    suppressSyncTriggers: () => {},
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+  } as unknown as SyncRuntime;
+
+  setSyncRuntime(runtime);
+}
+
+function configureBackfillRuntime(): void {
+  const entityTable = sqliteTable("entity_table", {
+    id: text("id").primaryKey(),
+    lastModifiedAt: text("last_modified_at"),
+  });
+
+  const queueColumns = {
+    id: { name: "id" },
+    tableName: { name: "table_name" },
+    rowId: { name: "row_id" },
+  } as unknown as SyncPushQueueTable;
+
+  const runtime = {
+    schema: {
+      syncableTables: ["entity_table"],
+      tableRegistry: {
+        entity_table: {
+          primaryKey: "id",
+          uniqueKeys: null,
+          timestamps: ["last_modified_at"],
+          booleanColumns: [],
+          supportsIncremental: true,
+          hasDeletedFlag: false,
+        },
+      },
+      tableSyncOrder: {},
+      tableToSchemaKey: { entity_table: "entityTable" },
+    },
+    syncPushQueue: queueColumns,
+    localSchema: { entityTable },
     getSqliteInstance: async () => null,
     loadOutboxBackupForUser: async () => null,
     clearOutboxBackupForUser: async () => {},
@@ -263,6 +312,39 @@ describe("outbox utilities", () => {
       await clearOldOutboxItems(db, 7 * 24 * 60 * 60 * 1000);
 
       expect(deleteCalls).toBe(1);
+    });
+  });
+
+  describe("backfillOutboxForTable", () => {
+    it("skips device-scoped backfill when the table lacks device_id", async () => {
+      configureBackfillRuntime();
+
+      let insertedRows: unknown;
+      const db = {
+        all: async () => {
+          return [{ id: "entity-1" }];
+        },
+        select: () => ({
+          from: () => ({
+            where: async () => [],
+          }),
+        }),
+        insert: () => ({
+          values: (values: unknown) => {
+            insertedRows = values;
+          },
+        }),
+      } as unknown as SqliteDatabase;
+
+      const count = await backfillOutboxForTable(
+        db,
+        "entity_table",
+        "2025-01-01T00:00:00.000Z",
+        "local-device"
+      );
+
+      expect(count).toBe(0);
+      expect(insertedRows).toBeUndefined();
     });
   });
 
