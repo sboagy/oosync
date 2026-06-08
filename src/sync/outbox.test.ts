@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
 import { sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   backfillOutboxForTable,
   clearOldOutboxItems,
@@ -112,16 +112,21 @@ beforeEach(() => {
 });
 
 function createPendingItemsDb(items: OutboxItem[]): SqliteDatabase {
+  const limitedQuery = {
+    limit: async (limit: number) => items.slice(0, limit),
+  };
+  const orderedQuery = {
+    orderBy: () => limitedQuery,
+  };
+  const filteredQuery = {
+    where: () => orderedQuery,
+  };
+  const tableQuery = {
+    from: () => filteredQuery,
+  };
+
   return {
-    select: () => ({
-      from: () => ({
-        where: () => ({
-          orderBy: () => ({
-            limit: async (limit: number) => items.slice(0, limit),
-          }),
-        }),
-      }),
-    }),
+    select: () => tableQuery,
   } as unknown as SqliteDatabase;
 }
 
@@ -382,13 +387,7 @@ describe("outbox utilities", () => {
       const db = {} as unknown as SqliteDatabase;
 
       await expect(
-        fetchLocalRowByPrimaryKey(
-          db,
-          "unknown_table" as unknown as Parameters<
-            typeof fetchLocalRowByPrimaryKey
-          >[1],
-          "id-1"
-        )
+        fetchLocalRowByPrimaryKey(db, "unknown_table", "id-1")
       ).rejects.toThrow("Unknown table: unknown_table");
     });
   });
