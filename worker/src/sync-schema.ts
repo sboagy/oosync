@@ -115,6 +115,10 @@ export interface IPushSanitizeRule {
 export interface IPushUpsertRule {
   omitSetProps?: string[];
   retryMinimalPayloadKeepProps?: string[];
+  /** SQLSTATE codes (e.g. "23505") that trigger a minimal-payload retry. */
+  retryOnSqlStates?: string[];
+  /** Constraint names that trigger a minimal-payload retry. */
+  retryOnConstraints?: string[];
 }
 
 export interface IPushTableRule {
@@ -168,7 +172,7 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
   }
 
   function getWorkerConfig(): IWorkerSyncConfig {
-    return deps.workerSyncConfig as unknown as IWorkerSyncConfig;
+    return deps.workerSyncConfig as IWorkerSyncConfig;
   }
 
   function getPullRule(tableName: string): PullTableRule | undefined {
@@ -219,6 +223,63 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     return result;
   }
 
+  /** Evaluate a compound pull rule (AND/OR combination of nested rules). */
+  function evaluateCompoundRule(
+    rule: Extract<PullTableRule, { kind: "compound" }>,
+    params: Parameters<typeof applyPullRule>[1]
+  ): FilterCondition[] | null {
+    const nestedConditions: FilterCondition[] = [];
+
+    for (const nestedRule of rule.rules) {
+      const result = applyPullRule(nestedRule, params);
+      if (result !== null && result.length > 0) {
+        nestedConditions.push(...result);
+      } else if (rule.operator === "and") {
+        // For AND: if any nested rule returns null/empty, entire compound fails
+        return null;
+      }
+    }
+
+    if (nestedConditions.length === 0) return null;
+    if (nestedConditions.length === 1) return nestedConditions;
+
+    // Combine nested conditions with AND or OR (default: OR)
+    const operator = rule.operator || "or";
+    const combiner = operator === "and" ? and : or;
+    const combinedCondition = combiner(...nestedConditions);
+    return combinedCondition ? [combinedCondition] : null;
+  }
+
+  /** Simple (non-compound, non-RPC) pull rules keyed by kind. */
+  const SIMPLE_PULL_RULES: Record<
+    string,
+    (
+      col: DynamicPgTable[string],
+      params: Parameters<typeof applyPullRule>[1],
+      extra: Record<string, string>
+    ) => FilterCondition[] | null
+  > = {
+    eqUserId: (col, params) => [eq(col, params.userId)],
+    orNullEqUserId: (col, params) => {
+      const condition = or(isNull(col), eq(col, params.userId));
+      return condition ? [condition] : [];
+    },
+    inCollection: (col, params, extra) => {
+      const ids = params.collections[extra.collection];
+      const arr = ids ? Array.from(ids) : [];
+      if (arr.length === 0) return null;
+      return [inArray(col, arr)];
+    },
+    orEqUserIdOrTrue: (col, params, extra) => {
+      const orProp = snakeToCamel(extra.orColumn);
+      const orCol = params.table[orProp];
+      if (!orCol) return [];
+      const condition = or(eq(col, params.userId), eq(orCol, true));
+      return condition ? [condition] : [];
+    },
+    publicOnly: (col) => [isNull(col)],
+  };
+
   function applyPullRule(
     rule: PullTableRule,
     params: {
@@ -230,64 +291,25 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
   ): FilterCondition[] | null {
     // RPC rules handle all filtering server-side (no WHERE clause needed)
     if (rule.kind === "rpc") {
-      return []; // Empty array = no additional filters (RPC handles everything)
+      return [];
     }
 
-    // Compound rule: evaluate each nested rules and combine with OR or AND
+    // Compound rule: delegate to helper
     if (rule.kind === "compound") {
-      const nestedConditions: FilterCondition[] = [];
-
-      for (const nestedRule of rule.rules) {
-        const result = applyPullRule(nestedRule, params);
-        if (result !== null && result.length > 0) {
-          nestedConditions.push(...result);
-        } else if (rule.operator === "and") {
-          // For AND: if any nested rule returns null/empty, entire compound fails
-          return null;
-        }
-      }
-
-      if (nestedConditions.length === 0) return null;
-      if (nestedConditions.length === 1) return nestedConditions;
-
-      // Combine nested conditions with AND or OR (default: OR)
-      const operator = rule.operator || "or";
-      const combiner = operator === "and" ? and : or;
-      const combinedCondition = combiner(...nestedConditions);
-      return combinedCondition ? [combinedCondition] : null;
+      return evaluateCompoundRule(rule, params);
     }
 
-    // Simple rules: resolve column and apply filter
+    // Simple rules: resolve column, then dispatch by kind
     const prop = snakeToCamel(rule.column);
     const col = params.table[prop];
     if (!col) return [];
 
-    if (rule.kind === "eqUserId") {
-      return [eq(col, params.userId)];
-    }
-
-    if (rule.kind === "orNullEqUserId") {
-      const condition = or(isNull(col), eq(col, params.userId));
-      return condition ? [condition] : [];
-    }
-
-    if (rule.kind === "inCollection") {
-      const ids = params.collections[rule.collection];
-      const arr = ids ? Array.from(ids) : [];
-      if (arr.length === 0) return null;
-      return [inArray(col, arr)];
-    }
-
-    if (rule.kind === "orEqUserIdOrTrue") {
-      const orProp = snakeToCamel(rule.orColumn);
-      const orCol = params.table[orProp];
-      if (!orCol) return [];
-      const condition = or(eq(col, params.userId), eq(orCol, true));
-      return condition ? [condition] : [];
-    }
-
-    if (rule.kind === "publicOnly") {
-      return [isNull(col)];
+    const handler = SIMPLE_PULL_RULES[rule.kind];
+    if (handler) {
+      // Each simple rule variant carries its extra properties directly on the rule object
+      // (e.g. `collection` for inCollection, `orColumn` for orEqUserIdOrTrue).
+      const extras = rule as Record<string, string>;
+      return handler(col, params, extras);
     }
 
     return [];
@@ -361,6 +383,86 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     return result;
   }
 
+  /** Ensure sync metadata props (lastModifiedAt, syncVersion) are present. */
+  function applySyncPropsSanitize(
+    result: Record<string, unknown>,
+    changed: string[],
+    changeLastModifiedAt: string
+  ): void {
+    if (
+      typeof result.lastModifiedAt !== "string" ||
+      result.lastModifiedAt === ""
+    ) {
+      result.lastModifiedAt = changeLastModifiedAt;
+      changed.push("lastModifiedAt");
+    }
+    if (
+      typeof result.syncVersion !== "number" &&
+      !(
+        typeof result.syncVersion === "string" &&
+        result.syncVersion.trim() !== ""
+      )
+    ) {
+      result.syncVersion = 1;
+      changed.push("syncVersion");
+    }
+  }
+
+  /** Coerce a single string value to number (or null if invalid). Returns true if changed. */
+  function coerceNumericString(
+    result: Record<string, unknown>,
+    prop: string,
+    trimmed: string,
+    kind: NumericKind
+  ): boolean {
+    if (trimmed === "") {
+      result[prop] = null;
+      return true;
+    }
+    const parsed =
+      kind === "int" ? Number.parseInt(trimmed, 10) : Number(trimmed);
+    if (!Number.isFinite(parsed)) {
+      result[prop] = null;
+      return true;
+    }
+    result[prop] = kind === "int" ? Math.trunc(parsed) : parsed;
+    return true;
+  }
+
+  /** Coerce numeric-like string values (and non-finite numbers) to proper numbers or null. */
+  function applyNumericCoercion(
+    result: Record<string, unknown>,
+    changed: string[],
+    fields: Array<{ prop: string; kind: NumericKind }>
+  ): void {
+    for (const field of fields) {
+      const value = result[field.prop];
+      if (typeof value === "string") {
+        if (coerceNumericString(result, field.prop, value.trim(), field.kind)) {
+          changed.push(field.prop);
+        }
+      } else if (typeof value === "number" && !Number.isFinite(value)) {
+        result[field.prop] = null;
+        changed.push(field.prop);
+      }
+    }
+  }
+
+  /** Replace empty-string values with null for configured props. */
+  function applyNullIfEmptyString(
+    result: Record<string, unknown>,
+    changed: string[],
+    props: readonly string[]
+  ): void {
+    for (const prop of props) {
+      const value = result[prop];
+      if (typeof value === "string" && value.trim() === "") {
+        result[prop] = null;
+        changed.push(prop);
+      }
+    }
+  }
+
   function sanitizeForPush(params: {
     tableName: string;
     changeLastModifiedAt: string;
@@ -374,56 +476,15 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     const result: Record<string, unknown> = { ...params.data };
 
     if (sanitize.ensureSyncProps) {
-      if (
-        typeof result.lastModifiedAt !== "string" ||
-        result.lastModifiedAt === ""
-      ) {
-        result.lastModifiedAt = params.changeLastModifiedAt;
-        changed.push("lastModifiedAt");
-      }
-      if (
-        typeof result.syncVersion !== "number" &&
-        !(
-          typeof result.syncVersion === "string" &&
-          result.syncVersion.trim() !== ""
-        )
-      ) {
-        result.syncVersion = 1;
-        changed.push("syncVersion");
-      }
+      applySyncPropsSanitize(result, changed, params.changeLastModifiedAt);
     }
 
-    const numeric = sanitize.coerceNumericProps ?? [];
-    for (const field of numeric) {
-      const value = result[field.prop];
-      if (typeof value === "string") {
-        const trimmed = value.trim();
-        if (trimmed === "") {
-          result[field.prop] = null;
-          changed.push(field.prop);
-          continue;
-        }
-        const parsed =
-          field.kind === "int" ? Number.parseInt(trimmed, 10) : Number(trimmed);
-        if (!Number.isFinite(parsed)) {
-          result[field.prop] = null;
-          changed.push(field.prop);
-          continue;
-        }
-        result[field.prop] = field.kind === "int" ? Math.trunc(parsed) : parsed;
-        changed.push(field.prop);
-      } else if (typeof value === "number" && !Number.isFinite(value)) {
-        result[field.prop] = null;
-        changed.push(field.prop);
-      }
+    if (sanitize.coerceNumericProps) {
+      applyNumericCoercion(result, changed, sanitize.coerceNumericProps);
     }
 
-    for (const prop of sanitize.nullIfEmptyStringProps ?? []) {
-      const value = result[prop];
-      if (typeof value === "string" && value.trim() === "") {
-        result[prop] = null;
-        changed.push(prop);
-      }
+    if (sanitize.nullIfEmptyStringProps) {
+      applyNullIfEmptyString(result, changed, sanitize.nullIfEmptyStringProps);
     }
 
     return { data: result, changed };

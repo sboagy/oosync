@@ -712,7 +712,28 @@ async function applyUpsertWithRetry(
       await applyUpsert(sp, table, keyCols, data, upsertOpts);
     });
   } catch (e) {
+    // Only retry when the error matches a configured retriable SQLSTATE or constraint.
+    const retryOnSqlStates = pushRule?.upsert?.retryOnSqlStates;
+    const retryOnConstraints = pushRule?.upsert?.retryOnConstraints;
+    const hasRetryStates = retryOnSqlStates && retryOnSqlStates.length > 0;
+    const hasRetryConstraints =
+      retryOnConstraints && retryOnConstraints.length > 0;
+
     if (!keepProps || keepProps.length === 0) throw e;
+    if (!hasRetryStates && !hasRetryConstraints) throw e;
+
+    const pgErr = findPostgresErrorLike(e);
+    const sqlState = toOptionalString(pgErr?.code);
+    const constraint = toOptionalString(pgErr?.constraint_name);
+
+    const matchesState =
+      hasRetryStates && sqlState && retryOnSqlStates?.includes(sqlState);
+    const matchesConstraint =
+      hasRetryConstraints &&
+      constraint &&
+      retryOnConstraints?.includes(constraint);
+
+    if (!matchesState && !matchesConstraint) throw e;
 
     console.warn(
       `[PUSH] ${change.table} upsert retry (minimal payload) rowId=${change.rowId}: ${formatDbError(
@@ -1557,6 +1578,16 @@ async function runSyncTransaction(params: {
     params.perfMinDurationMs,
     Date.now() - pushStartedAt,
     `sync.push changes=${params.payload.changes.length}`
+  );
+
+  // Reload collections after push so the pull phase sees any collection/ownership
+  // changes written during the push (e.g. newly created rows in collection-backed tables).
+  ctx.collections = await loadCollectionsForSync(
+    params.tx,
+    authUserId,
+    params.payload,
+    params.perfDebugEnabled,
+    params.perfMinDurationMs
   );
 
   const result = await processPullForSync(
