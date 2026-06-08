@@ -35,8 +35,6 @@ import { createSyncSchema } from "./sync-schema";
 const CORE_COL_DELETED = "deleted";
 const CORE_COL_LAST_MODIFIED_AT = "last_modified_at";
 
-type SyncableTableName = string;
-
 export interface WorkerArtifacts extends SyncSchemaDeps {
   schemaTables: SchemaTables;
 }
@@ -170,17 +168,17 @@ function findPostgresErrorLike(
     if (isPostgresJsErrorLike(current)) {
       // Heuristic: if it has any of the Postgres-ish fields, treat it as one.
       if (
-        typeof current.code !== "undefined" ||
-        typeof current.detail !== "undefined" ||
-        typeof current.constraint_name !== "undefined" ||
-        typeof current.table_name !== "undefined" ||
-        typeof current.column_name !== "undefined"
+        current.code !== undefined ||
+        current.detail !== undefined ||
+        current.constraint_name !== undefined ||
+        current.table_name !== undefined ||
+        current.column_name !== undefined
       ) {
         return current;
       }
     }
     const next = getErrorCause(current);
-    if (typeof next === "undefined") break;
+    if (next === undefined) break;
     current = next;
   }
   return undefined;
@@ -310,11 +308,7 @@ type Hyperdrive = {
   connectionString?: string;
 };
 
-type IncomingSyncTableName =
-  | SyncableTableName
-  | "sync_push_queue"
-  | "sync_change_log";
-type IncomingSyncChange = SyncChange<IncomingSyncTableName>;
+type IncomingSyncChange = SyncChange<string>;
 
 function isClientSyncChange(change: IncomingSyncChange): boolean {
   return (
@@ -398,7 +392,6 @@ function decodeCursor(raw: string): InitialSyncCursorV1 {
   return { v: 1, tableIndex, offset, syncStartedAt };
 }
 
-type DrizzleTable = DynamicPgTable;
 type DrizzleColumn = AnyPgColumn;
 type Transaction = PgTransaction<
   PgQueryResultHKT,
@@ -427,7 +420,7 @@ type TransactionWithSession = Transaction & {
  */
 function getConflictKeyColumns(
   tableName: string,
-  table: DrizzleTable
+  table: DynamicPgTable
 ): { col: DrizzleColumn; prop: string }[] {
   const snakeKeys = getConflictTarget(tableName);
   return snakeKeys.map((snakeKey) => {
@@ -448,7 +441,7 @@ function getConflictKeyColumns(
  */
 function getPrimaryKeyColumns(
   tableName: string,
-  table: DrizzleTable
+  table: DynamicPgTable
 ): { col: DrizzleColumn; prop: string }[] {
   const primaryKey = getPrimaryKey(tableName);
   const snakeKeys = Array.isArray(primaryKey) ? primaryKey : [primaryKey];
@@ -468,11 +461,14 @@ function getPrimaryKeyColumns(
 function extractRowId(
   tableName: string,
   row: Record<string, unknown>,
-  table: DrizzleTable
+  table: DynamicPgTable
 ): string {
   // Most tables have 'id' as primary key
-  if (row.id != null) {
+  if (typeof row.id === "string" || typeof row.id === "number") {
     return String(row.id);
+  }
+  if (typeof row.id === "boolean" || typeof row.id === "bigint") {
+    return row.id.toString();
   }
 
   // Composite key - serialize to JSON
@@ -599,8 +595,7 @@ function resolveRpcParamsForRule(params: {
         break;
       case "requestOverride": {
         const overrideKey = binding.key ?? paramName;
-        out[paramName] =
-          ruleOverrides[overrideKey as keyof typeof ruleOverrides] ?? null;
+        out[paramName] = ruleOverrides[overrideKey] ?? null;
         break;
       }
       default:
@@ -664,6 +659,73 @@ function postgresToSqlite(
   return result;
 }
 
+function preparePushData(
+  change: IncomingSyncChange,
+  pushRule: IPushTableRule | undefined,
+  ctx: SyncContext
+): Record<string, unknown> {
+  let data = sqliteToPostgres(change.table, change.data);
+  data = remapUserRefsForPush(data, ctx);
+
+  const bindAuthUserIdProps = pushRule?.bindAuthUserIdProps ?? [];
+  if (bindAuthUserIdProps.length > 0 && ctx.authUserId) {
+    const boundData = { ...data };
+    for (const prop of bindAuthUserIdProps) {
+      boundData[prop] = ctx.authUserId;
+    }
+    data = boundData;
+  }
+
+  // Normalize timestamps for Postgres (add 'Z' suffix if missing, etc.)
+  data = normalizeRowForSync(change.table, data);
+
+  const sanitized = sanitizeForPush({
+    tableName: change.table,
+    changeLastModifiedAt: change.lastModifiedAt,
+    data,
+  });
+
+  if (sanitized.changed.length > 0) {
+    console.warn(
+      `[PUSH] Sanitized ${change.table} rowId=${change.rowId}: ${sanitized.changed.join(", ")}`
+    );
+  }
+
+  return sanitized.data;
+}
+
+async function applyUpsertWithRetry(
+  tx: Transaction,
+  table: DynamicPgTable,
+  keyCols: { col: DrizzleColumn; prop: string }[],
+  data: Record<string, unknown>,
+  change: IncomingSyncChange,
+  pushRule: IPushTableRule | undefined
+): Promise<void> {
+  const omitSetProps = pushRule?.upsert?.omitSetProps;
+  const keepProps = pushRule?.upsert?.retryMinimalPayloadKeepProps;
+  const upsertOpts = omitSetProps ? ({ omitSetProps } as const) : undefined;
+
+  try {
+    // Use a savepoint so a failed statement doesn't abort the outer transaction.
+    await tx.transaction(async (sp) => {
+      await applyUpsert(sp, table, keyCols, data, upsertOpts);
+    });
+  } catch (e) {
+    if (!keepProps || keepProps.length === 0) throw e;
+
+    console.warn(
+      `[PUSH] ${change.table} upsert retry (minimal payload) rowId=${change.rowId}: ${formatDbError(
+        e
+      )}`
+    );
+    const minimal = minimalPayload(data, keepProps);
+    await tx.transaction(async (sp) => {
+      await applyUpsert(sp, table, keyCols, minimal, upsertOpts);
+    });
+  }
+}
+
 // ============================================================================
 // UTILITY: Authentication
 // ============================================================================
@@ -697,18 +759,13 @@ async function verifyJwt(
     // Peek at the JWT header to choose verification strategy
     const [headerB64] = token.split(".");
     const headerJson = JSON.parse(
-      atob(headerB64.replace(/-/g, "+").replace(/_/g, "/"))
+      atob(headerB64.replaceAll("-", "+").replaceAll("_", "/"))
     );
     const algorithm = headerJson.alg;
 
     let payload: { sub?: string };
 
-    if (algorithm === "ES256") {
-      // ES256 (Supabase CLI >= 2.75): fetch public key from JWKS endpoint
-      debug.log("[AUTH] Using ES256 verification via JWKS");
-      const result = await jwtVerify(token, getJwks(supabaseUrl));
-      payload = result.payload;
-    } else {
+    if (algorithm === "HS256") {
       // HS256 (Supabase CLI < 2.75): symmetric secret
       if (!secret) {
         console.error(
@@ -718,6 +775,11 @@ async function verifyJwt(
       }
       debug.log("[AUTH] Using HS256 verification");
       const result = await jwtVerify(token, new TextEncoder().encode(secret));
+      payload = result.payload;
+    } else {
+      // Asymmetric Supabase JWTs (for example RS256/ES256) publish public keys via JWKS.
+      debug.log(`[AUTH] Using ${algorithm} verification via JWKS`);
+      const result = await jwtVerify(token, getJwks(supabaseUrl));
       payload = result.payload;
     }
 
@@ -761,7 +823,7 @@ async function applyChange(
     return;
   }
 
-  const t = table as DrizzleTable;
+  const t = table;
   if (!t.lastModifiedAt) {
     debug.log(
       `[PUSH] Table ${change.table} has no lastModifiedAt column, skipping`
@@ -771,35 +833,7 @@ async function applyChange(
 
   const upsertKeyCols = getConflictKeyColumns(change.table, t);
   const deleteKeyCols = getPrimaryKeyColumns(change.table, t);
-  let data = sqliteToPostgres(
-    change.table,
-    change.data as Record<string, unknown>
-  );
-  data = remapUserRefsForPush(data, ctx);
-
-  const bindAuthUserIdProps = pushRule?.bindAuthUserIdProps ?? [];
-  if (bindAuthUserIdProps.length > 0 && ctx.authUserId) {
-    const boundData = { ...data };
-    for (const prop of bindAuthUserIdProps) {
-      boundData[prop] = ctx.authUserId;
-    }
-    data = boundData;
-  }
-
-  // Normalize timestamps for Postgres (add 'Z' suffix if missing, etc.)
-  data = normalizeRowForSync(change.table, data);
-
-  const sanitized = sanitizeForPush({
-    tableName: change.table,
-    changeLastModifiedAt: change.lastModifiedAt,
-    data,
-  });
-  data = sanitized.data;
-  if (sanitized.changed.length > 0) {
-    console.warn(
-      `[PUSH] Sanitized ${change.table} rowId=${change.rowId}: ${sanitized.changed.join(", ")}`
-    );
-  }
+  const data = preparePushData(change, pushRule, ctx);
 
   debug.log(
     `[PUSH] Applying ${change.deleted ? "DELETE" : "UPSERT"} to ${change.table}, rowId: ${change.rowId}`
@@ -815,46 +849,32 @@ async function applyChange(
       change
     );
   } else {
-    const omitSetProps = pushRule?.upsert?.omitSetProps;
-    const keepProps = pushRule?.upsert?.retryMinimalPayloadKeepProps;
-    const upsertOpts = omitSetProps ? ({ omitSetProps } as const) : undefined;
-
-    try {
-      // Use a savepoint so a failed statement doesn't abort the outer transaction.
-      await tx.transaction(async (sp) => {
-        await applyUpsert(sp, table, upsertKeyCols, data, upsertOpts);
-      });
-    } catch (e) {
-      if (!keepProps || keepProps.length === 0) throw e;
-
-      console.warn(
-        `[PUSH] ${change.table} upsert retry (minimal payload) rowId=${change.rowId}: ${formatDbError(
-          e
-        )}`
-      );
-      const minimal = minimalPayload(data, keepProps);
-      await tx.transaction(async (sp) => {
-        await applyUpsert(sp, table, upsertKeyCols, minimal, upsertOpts);
-      });
-    }
+    await applyUpsertWithRetry(
+      tx,
+      table,
+      upsertKeyCols,
+      data,
+      change,
+      pushRule
+    );
   }
 }
 
 async function applyDelete(
   tx: Transaction,
   tableName: string,
-  table: DrizzleTable,
+  table: DynamicPgTable,
   primaryKeyCols: { col: DrizzleColumn; prop: string }[],
   conflictKeyCols: { col: DrizzleColumn; prop: string }[],
   change: SyncChange
 ): Promise<void> {
-  const changeData = change.data as Record<string, unknown>;
+  const changeData = change.data;
 
   const buildWhere = (cols: { col: DrizzleColumn; prop: string }[]) => {
     const missing: string[] = [];
     const whereConditions = cols.map((pk) => {
       const value = changeData[pk.prop];
-      if (typeof value === "undefined" || value === null) {
+      if (value === undefined || value === null) {
         missing.push(pk.prop);
       }
       return eq(pk.col, value);
@@ -895,7 +915,7 @@ async function applyDelete(
 
 async function applyUpsert(
   tx: Transaction,
-  table: DrizzleTable,
+  table: DynamicPgTable,
   pkCols: { col: DrizzleColumn; prop: string }[],
   data: Record<string, unknown>,
   opts?: {
@@ -964,12 +984,12 @@ function rowToSyncChange(
   data = postgresToSqlite(tableName, data);
 
   return {
-    table: tableName as SyncableTableName,
+    table: tableName,
     rowId,
     data,
     deleted: !!data.deleted,
     lastModifiedAt:
-      (data.lastModifiedAt as string) || new Date(0).toISOString(),
+      toOptionalString(data.lastModifiedAt) ?? new Date(0).toISOString(),
   };
 }
 
@@ -979,7 +999,7 @@ function rowToSyncChange(
 
 async function fetchTableForInitialSyncPage(
   tx: Transaction,
-  tableName: SyncableTableName,
+  tableName: string,
   ctx: SyncContext,
   syncStartedAt: string,
   offset: number,
@@ -988,7 +1008,7 @@ async function fetchTableForInitialSyncPage(
   const table = getSchemaTables()[tableName];
   if (!table) return [];
 
-  const t = table as DrizzleTable;
+  const t = table;
   const meta = TABLE_REGISTRY[tableName];
   if (!meta) return [];
 
@@ -1056,7 +1076,7 @@ async function fetchTableForInitialSyncPage(
 
   const changes: SyncChange[] = [];
   for (const row of rows) {
-    const r = row as Record<string, unknown>;
+    const r = row;
     const rowId = extractRowId(tableName, r, t);
     changes.push(rowToSyncChange(tableName, rowId, r));
   }
@@ -1099,7 +1119,7 @@ async function processInitialSyncPaged(
 
   // Advance until we find a table with rows to return, or we finish.
   while (tableIndex < SYNCABLE_TABLES.length) {
-    const tableName = SYNCABLE_TABLES[tableIndex] as SyncableTableName;
+    const tableName = SYNCABLE_TABLES[tableIndex];
     if (ctx.pullTables && !ctx.pullTables.has(tableName)) {
       tableIndex += 1;
       offset = 0;
@@ -1205,14 +1225,14 @@ async function getChangedTables(
  */
 async function fetchChangedRowsFromTable(
   tx: Transaction,
-  tableName: SyncableTableName,
+  tableName: string,
   lastSyncAt: string,
   ctx: SyncContext
 ): Promise<SyncChange[]> {
   const table = getSchemaTables()[tableName];
   if (!table) return [];
 
-  const t = table as DrizzleTable;
+  const t = table;
   if (!t.lastModifiedAt) {
     debug.log(`[PULL:INCR] ${tableName} has no lastModifiedAt, skipping`);
     return []; // Table doesn't support incremental sync
@@ -1263,7 +1283,7 @@ async function fetchChangedRowsFromTable(
   const allConditions =
     userConditions.length > 0
       ? // @ts-expect-error - dynamic where conditions with unknown types
-        and(timeCondition, ...(userConditions as unknown[]))
+        and(timeCondition, ...userConditions)
       : timeCondition;
 
   const rows = await tx.select().from(table).where(allConditions);
@@ -1274,7 +1294,7 @@ async function fetchChangedRowsFromTable(
   // Convert rows to SyncChanges
   const changes: SyncChange[] = [];
   for (const row of rows) {
-    const r = row as Record<string, unknown>;
+    const r = row;
     const rowId = extractRowId(tableName, r, t);
     changes.push(rowToSyncChange(tableName, rowId, r));
   }
@@ -1305,7 +1325,7 @@ async function processIncrementalSync(
   const allChanges: SyncChange[] = [];
   for (const tableName of changedTables) {
     // Only process tables we know about
-    if (!SYNCABLE_TABLES.includes(tableName as SyncableTableName)) {
+    if (!SYNCABLE_TABLES.includes(tableName)) {
       debug.log(`[PULL:INCR] Skipping unknown table: ${tableName}`);
       continue;
     }
@@ -1314,7 +1334,7 @@ async function processIncrementalSync(
     }
     const tableChanges = await fetchChangedRowsFromTable(
       tx,
-      tableName as SyncableTableName,
+      tableName,
       lastSyncAt,
       ctx
     );
@@ -1330,6 +1350,243 @@ async function processIncrementalSync(
 // ============================================================================
 // MAIN SYNC HANDLER
 // ============================================================================
+
+type SyncType = "INITIAL" | "INCREMENTAL";
+
+interface SyncTransactionResult {
+  responseChanges: SyncChange[];
+  nextCursor?: string;
+  syncStartedAt?: string;
+}
+
+function getCursorSummary(payload: SyncRequest): string {
+  if (!payload.pullCursor) {
+    return "cursor=none";
+  }
+
+  try {
+    const cursor = decodeCursor(payload.pullCursor);
+    return `tableIndex=${cursor.tableIndex} offset=${cursor.offset}`;
+  } catch {
+    return "cursor=invalid";
+  }
+}
+
+function addStartDiagnostics(
+  diag: string[],
+  payload: SyncRequest,
+  syncType: SyncType
+): void {
+  diag.push(
+    `[WorkerSyncDiag] type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} ${getCursorSummary(payload)}`
+  );
+}
+
+function addResponseDiagnostics(
+  diag: string[],
+  responseChanges: SyncChange[],
+  nextCursor: string | undefined,
+  syncStartedAt: string | undefined
+): void {
+  const tableCounts: Record<string, number> = {};
+  for (const change of responseChanges) {
+    tableCounts[change.table] = (tableCounts[change.table] ?? 0) + 1;
+  }
+  const top = Object.entries(tableCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([tableName, count]) => `${tableName}:${count}`)
+    .join(",");
+  diag.push(
+    `[WorkerSyncDiag] changesOut=${responseChanges.length} nextCursor=${nextCursor ? "yes" : "no"} syncStartedAt=${syncStartedAt ?? "null"} topTables=${top || "(none)"}`
+  );
+}
+
+function applyCollectionOverrides(
+  collections: Record<string, Set<string>>,
+  overrides: SyncRequest["collectionsOverride"]
+): void {
+  if (!overrides) {
+    return;
+  }
+
+  for (const [collectionName, values] of Object.entries(overrides)) {
+    const asArray = Array.isArray(values) ? values : [];
+    collections[collectionName] = new Set(asArray.map(String));
+  }
+}
+
+function buildRpcParamOverrides(
+  overrides: SyncRequest["rpcParamOverrides"]
+): Record<string, Record<string, unknown>> | undefined {
+  if (!overrides) {
+    return undefined;
+  }
+
+  return Object.fromEntries(
+    Object.entries(overrides).map(([functionName, mapping]) => [
+      functionName,
+      mapping ?? {},
+    ])
+  );
+}
+
+function buildPullTables(
+  pullTables: SyncRequest["pullTables"]
+): Set<string> | undefined {
+  return pullTables ? new Set(pullTables.map(String)) : undefined;
+}
+
+function logPullTableMode(pullTables: Set<string> | undefined): void {
+  if (pullTables) {
+    debug.log(
+      `[Worker] 🚨 pullTables override received: ${Array.from(pullTables).join(", ")}`
+    );
+    return;
+  }
+
+  debug.log("[Worker] 🚨 No pullTables override - syncing all tables");
+}
+
+async function loadCollectionsForSync(
+  tx: Transaction,
+  authUserId: string,
+  payload: SyncRequest,
+  perfDebugEnabled: boolean,
+  perfMinDurationMs: number
+): Promise<Record<string, Set<string>>> {
+  const collectionsStartedAt = Date.now();
+  const collections = await loadUserCollections({
+    tx,
+    userId: authUserId,
+    tables: getSchemaTables(),
+  });
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    Date.now() - collectionsStartedAt,
+    "sync.collections"
+  );
+  applyCollectionOverrides(collections, payload.collectionsOverride);
+  return collections;
+}
+
+async function processPullForSync(
+  tx: Transaction,
+  payload: SyncRequest,
+  ctx: SyncContext,
+  perfDebugEnabled: boolean,
+  perfMinDurationMs: number
+): Promise<SyncTransactionResult> {
+  const pullStartedAt = Date.now();
+  if (payload.lastSyncAt) {
+    const responseChanges = await processIncrementalSync(
+      tx,
+      payload.lastSyncAt,
+      ctx
+    );
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - pullStartedAt,
+      `sync.pull.incremental changesOut=${responseChanges.length}`
+    );
+    return { responseChanges };
+  }
+
+  // Paginate initial sync to avoid oversized payloads / timeouts.
+  const page = await processInitialSyncPaged(
+    tx,
+    ctx,
+    payload.pullCursor,
+    payload.syncStartedAt,
+    payload.pageSize
+  );
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    Date.now() - pullStartedAt,
+    `sync.pull.initial pageChanges=${page.changes.length} nextCursor=${page.nextCursor ? "yes" : "no"}`
+  );
+  return {
+    responseChanges: page.changes,
+    nextCursor: page.nextCursor,
+    syncStartedAt: page.syncStartedAt,
+  };
+}
+
+async function runSyncTransaction(params: {
+  tx: Transaction;
+  payload: SyncRequest;
+  userId: string;
+  now: string;
+  diagnosticsEnabled: boolean;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  syncType: SyncType;
+  diag: string[];
+}): Promise<SyncTransactionResult> {
+  const txStartedAt = Date.now();
+  const authUserId = params.userId;
+  const collections = await loadCollectionsForSync(
+    params.tx,
+    authUserId,
+    params.payload,
+    params.perfDebugEnabled,
+    params.perfMinDurationMs
+  );
+  const pullTables = buildPullTables(params.payload.pullTables);
+  logPullTableMode(pullTables);
+
+  const ctx: SyncContext = {
+    userId: authUserId,
+    authUserId,
+    collections,
+    rpcParamOverrides: buildRpcParamOverrides(params.payload.rpcParamOverrides),
+    pullTables,
+    now: params.now,
+    diagnosticsEnabled: params.diagnosticsEnabled,
+    perfDebugEnabled: params.perfDebugEnabled,
+    perfMinDurationMs: params.perfMinDurationMs,
+  };
+
+  const pushStartedAt = Date.now();
+  await processPushChanges(params.tx, ctx, params.payload.changes);
+  perfLogDuration(
+    params.perfDebugEnabled,
+    params.perfMinDurationMs,
+    Date.now() - pushStartedAt,
+    `sync.push changes=${params.payload.changes.length}`
+  );
+
+  const result = await processPullForSync(
+    params.tx,
+    params.payload,
+    ctx,
+    params.perfDebugEnabled,
+    params.perfMinDurationMs
+  );
+
+  if (params.diagnosticsEnabled) {
+    addResponseDiagnostics(
+      params.diag,
+      result.responseChanges,
+      result.nextCursor,
+      result.syncStartedAt
+    );
+  }
+
+  // NO GARBAGE COLLECTION NEEDED!
+  // sync_change_log now has at most ~20 rows (one per table)
+  perfLogDuration(
+    params.perfDebugEnabled,
+    params.perfMinDurationMs,
+    Date.now() - txStartedAt,
+    `sync.transaction type=${params.syncType}`
+  );
+
+  return result;
+}
 
 async function handleSync(
   db: ReturnType<typeof drizzle>,
@@ -1353,19 +1610,7 @@ async function handleSync(
   );
 
   if (diagnosticsEnabled) {
-    const cursorSummary = payload.pullCursor
-      ? (() => {
-          try {
-            const c = decodeCursor(payload.pullCursor);
-            return `tableIndex=${c.tableIndex} offset=${c.offset}`;
-          } catch {
-            return "cursor=invalid";
-          }
-        })()
-      : "cursor=none";
-    diag.push(
-      `[WorkerSyncDiag] type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} ${cursorSummary}`
-    );
+    addStartDiagnostics(diag, payload, syncType);
   }
 
   debug.log(`[SYNC] === Starting ${syncType} sync for user ${userId} ===`);
@@ -1374,136 +1619,20 @@ async function handleSync(
   );
 
   await db.transaction(async (tx) => {
-    const txStartedAt = Date.now();
-
-    // JWT subject is used as authenticated user identifier.
-    const authUserId = userId;
-
-    const collectionsStartedAt = Date.now();
-    const collections = await loadUserCollections({
+    const result = await runSyncTransaction({
       tx,
-      userId: authUserId,
-      tables: getSchemaTables(),
-    });
-    perfLogDuration(
-      perfDebugEnabled,
-      perfMinDurationMs,
-      Date.now() - collectionsStartedAt,
-      "sync.collections"
-    );
-
-    if (payload.collectionsOverride) {
-      for (const [collectionName, values] of Object.entries(
-        payload.collectionsOverride
-      )) {
-        const asArray = Array.isArray(values) ? values : [];
-        collections[collectionName] = new Set(asArray.map((v) => String(v)));
-      }
-    }
-
-    const rpcParamOverrides = payload.rpcParamOverrides
-      ? Object.fromEntries(
-          Object.entries(payload.rpcParamOverrides).map(
-            ([functionName, mapping]) => [
-              functionName,
-              (mapping ?? {}) as Record<string, unknown>,
-            ]
-          )
-        )
-      : undefined;
-
-    const pullTables = payload.pullTables
-      ? new Set(payload.pullTables.map((t) => String(t)))
-      : undefined;
-
-    if (pullTables) {
-      debug.log(
-        `[Worker] 🚨 pullTables override received: ${Array.from(pullTables).join(", ")}`
-      );
-    } else {
-      debug.log("[Worker] 🚨 No pullTables override - syncing all tables");
-    }
-
-    const ctx: SyncContext = {
-      userId: authUserId,
-      authUserId,
-      collections,
-      rpcParamOverrides,
-      pullTables,
+      payload,
+      userId,
       now,
       diagnosticsEnabled,
       perfDebugEnabled,
       perfMinDurationMs,
-    };
-
-    // PUSH: Apply client changes
-    const pushStartedAt = Date.now();
-    await processPushChanges(tx, ctx, payload.changes as IncomingSyncChange[]);
-    perfLogDuration(
-      perfDebugEnabled,
-      perfMinDurationMs,
-      Date.now() - pushStartedAt,
-      `sync.push changes=${payload.changes.length}`
-    );
-
-    // PULL: Gather changes for client
-    const pullStartedAt = Date.now();
-    if (payload.lastSyncAt) {
-      responseChanges = await processIncrementalSync(
-        tx,
-        payload.lastSyncAt,
-        ctx
-      );
-      perfLogDuration(
-        perfDebugEnabled,
-        perfMinDurationMs,
-        Date.now() - pullStartedAt,
-        `sync.pull.incremental changesOut=${responseChanges.length}`
-      );
-    } else {
-      // Paginate initial sync to avoid oversized payloads / timeouts.
-      const page = await processInitialSyncPaged(
-        tx,
-        ctx,
-        payload.pullCursor,
-        payload.syncStartedAt,
-        payload.pageSize
-      );
-      responseChanges = page.changes;
-      nextCursor = page.nextCursor;
-      syncStartedAt = page.syncStartedAt;
-      perfLogDuration(
-        perfDebugEnabled,
-        perfMinDurationMs,
-        Date.now() - pullStartedAt,
-        `sync.pull.initial pageChanges=${responseChanges.length} nextCursor=${nextCursor ? "yes" : "no"}`
-      );
-    }
-
-    if (diagnosticsEnabled) {
-      const tableCounts: Record<string, number> = {};
-      for (const change of responseChanges) {
-        tableCounts[change.table] = (tableCounts[change.table] ?? 0) + 1;
-      }
-      const top = Object.entries(tableCounts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 8)
-        .map(([t, n]) => `${t}:${n}`)
-        .join(",");
-      diag.push(
-        `[WorkerSyncDiag] changesOut=${responseChanges.length} nextCursor=${nextCursor ? "yes" : "no"} syncStartedAt=${syncStartedAt ?? "null"} topTables=${top || "(none)"}`
-      );
-    }
-
-    // NO GARBAGE COLLECTION NEEDED!
-    // sync_change_log now has at most ~20 rows (one per table)
-
-    perfLogDuration(
-      perfDebugEnabled,
-      perfMinDurationMs,
-      Date.now() - txStartedAt,
-      `sync.transaction type=${syncType}`
-    );
+      syncType,
+      diag,
+    });
+    responseChanges = result.responseChanges;
+    nextCursor = result.nextCursor;
+    syncStartedAt = result.syncStartedAt;
   });
 
   debug.log(
@@ -1623,7 +1752,7 @@ async function fetch(request: Request, env: Env): Promise<Response> {
           env.SYNC_DIAGNOSTICS_USER_ID === userId);
 
       const payloadStartedAt = Date.now();
-      const payload = (await request.json()) as SyncRequest;
+      const payload: SyncRequest = await request.json();
       perfLogDuration(
         perfDebugEnabled,
         perfMinDurationMs,
