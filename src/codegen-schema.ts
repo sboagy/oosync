@@ -2290,21 +2290,6 @@ function buildIndexItems(params: {
   return configItems;
 }
 
-function hasEmittableIndexItems(
-  groupedIndexes: Map<string, IIndexKeyRow[]>,
-  tableNames: string[]
-): boolean {
-  return tableNames.some((tableName) =>
-    getGroupedRowsForTable(groupedIndexes, tableName).some((rows) => {
-      const sorted = getSortedRowsByPosition(rows);
-      return (
-        !!sorted[0]?.index_name &&
-        sorted.every((row) => parseIndexKeyToColumnName(row.keydef) !== null)
-      );
-    })
-  );
-}
-
 function buildSqliteConfigItems(params: {
   tableName: string;
   pkCols: IConstraintColumnRow[];
@@ -2401,37 +2386,49 @@ function buildSchemaTs(params: {
     params.strict
   );
 
-  const sqliteCoreImports = [
-    ...(hasEmittableIndexItems(idxByTableIndex, tables) ? ["index"] : []),
+  // Generate table definitions first so we can compute which drizzle
+  // builders are actually used (avoids unused-import lint errors).
+  const tableLines = tables.flatMap((tableName) => {
+    const ident = tableIdentByName.get(tableName);
+    return ident
+      ? buildSqliteTableLines({
+          tableName,
+          ident,
+          tableColumns: getSortedTableColumns(colsByTable, tableName),
+          pkCols: getSortedRowsByPosition(pkByTable.get(tableName)),
+          fkByTableCol,
+          tableIdentByName,
+          uniqueByTableConstraint,
+          idxByTableIndex,
+          strict: params.strict,
+        })
+      : [];
+  });
+
+  const tableContent = tableLines.join("\n");
+  const ALL_SQLITE_BUILDERS = [
+    "index",
     "integer",
     "primaryKey",
     "real",
     "sqliteTable",
     "text",
     "uniqueIndex",
-  ].join(", ");
+  ] as const;
+  const usedBuilders = ALL_SQLITE_BUILDERS.filter(
+    (b) => new RegExp(String.raw`\b${b}\(`).test(tableContent)
+  );
 
   return [
     createHeader({ schema: params.schema }),
-    `import { ${sqliteCoreImports} } from "drizzle-orm/sqlite-core";`,
+    ...(usedBuilders.length > 0
+      ? [
+          `import { ${usedBuilders.join(", ")} } from "drizzle-orm/sqlite-core";`,
+        ]
+      : []),
     'import { sqliteSyncColumns } from "oosync/shared/sync-columns";',
     "",
-    ...tables.flatMap((tableName) => {
-      const ident = tableIdentByName.get(tableName);
-      return ident
-        ? buildSqliteTableLines({
-            tableName,
-            ident,
-            tableColumns: getSortedTableColumns(colsByTable, tableName),
-            pkCols: getSortedRowsByPosition(pkByTable.get(tableName)),
-            fkByTableCol,
-            tableIdentByName,
-            uniqueByTableConstraint,
-            idxByTableIndex,
-            strict: params.strict,
-          })
-        : [];
-    }),
+    ...tableLines,
   ]
     .join("\n")
     .replace(/\n{3,}/g, "\n\n");
