@@ -2421,7 +2421,11 @@ function buildSchemaTs(params: {
 
   return [
     createHeader({ schema: params.schema }),
-    `import { ${usedBuilders.join(", ")} } from "drizzle-orm/sqlite-core";`,
+    ...(usedBuilders.length > 0
+      ? [
+          `import { ${usedBuilders.join(", ")} } from "drizzle-orm/sqlite-core";`,
+        ]
+      : []),
     'import { sqliteSyncColumns } from "oosync/shared/sync-columns";',
     "",
     ...tableLines,
