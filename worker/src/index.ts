@@ -362,6 +362,11 @@ interface InitialSyncPageState {
   offset: number;
 }
 
+interface InitialSyncPageBudget {
+  pageSize: number;
+  pageCount: number;
+}
+
 function encodeCursor(cursor: InitialSyncCursorV1): string {
   return btoa(JSON.stringify(cursor));
 }
@@ -411,6 +416,49 @@ function encodeNextInitialSyncCursor(
     offset: state.offset,
     syncStartedAt,
   });
+}
+
+function normalizePositiveIntegerHint(
+  value: number | undefined,
+  defaultValue: number,
+  maxValue: number
+): number {
+  const requested =
+    typeof value === "number" && Number.isFinite(value)
+      ? Math.max(1, Math.floor(value))
+      : defaultValue;
+  return Math.min(requested, maxValue);
+}
+
+function getInitialSyncPageBudget(
+  pageSizeHint: number | undefined,
+  pageCountHint: number | undefined
+): InitialSyncPageBudget {
+  return {
+    pageSize: normalizePositiveIntegerHint(pageSizeHint, 500, 500),
+    pageCount: normalizePositiveIntegerHint(pageCountHint, 1, 32),
+  };
+}
+
+function getInitialSyncStartState(params: {
+  cursorRaw?: string;
+  syncStartedAtHint?: string;
+  now: string;
+}): InitialSyncPageState & { syncStartedAt: string } {
+  if (!params.cursorRaw) {
+    return {
+      tableIndex: 0,
+      offset: 0,
+      syncStartedAt: params.syncStartedAtHint ?? params.now,
+    };
+  }
+
+  const cursor = decodeCursor(params.cursorRaw);
+  return {
+    tableIndex: cursor.tableIndex,
+    offset: cursor.offset,
+    syncStartedAt: cursor.syncStartedAt,
+  };
 }
 
 type DrizzleColumn = AnyPgColumn;
@@ -1136,38 +1184,22 @@ async function processInitialSyncPaged(
   changes: SyncChange[];
   nextCursor?: string;
   syncStartedAt: string;
+  diagnostics: string[];
 }> {
-  const MAX_PAGE_SIZE = 500;
-  const DEFAULT_PAGE_SIZE = 500;
-  const MAX_PAGE_COUNT = 32;
-  const DEFAULT_PAGE_COUNT = 1;
-  const requested =
-    typeof pageSizeHint === "number" && Number.isFinite(pageSizeHint)
-      ? Math.max(1, Math.floor(pageSizeHint))
-      : DEFAULT_PAGE_SIZE;
-  const pageSize = Math.min(requested, MAX_PAGE_SIZE);
-  const requestedPageCount =
-    typeof pageCountHint === "number" && Number.isFinite(pageCountHint)
-      ? Math.max(1, Math.floor(pageCountHint))
-      : DEFAULT_PAGE_COUNT;
-  const pageCount = Math.min(requestedPageCount, MAX_PAGE_COUNT);
-
-  let tableIndex = 0;
-  let offset = 0;
-  let syncStartedAt = syncStartedAtHint;
+  const { pageSize, pageCount } = getInitialSyncPageBudget(
+    pageSizeHint,
+    pageCountHint
+  );
+  const startState = getInitialSyncStartState({
+    cursorRaw,
+    syncStartedAtHint,
+    now: ctx.now,
+  });
+  let { tableIndex, offset } = startState;
+  const { syncStartedAt } = startState;
   const allChanges: SyncChange[] = [];
+  const diagnostics: string[] = [];
   let pagesCollected = 0;
-
-  if (cursorRaw) {
-    const cursor = decodeCursor(cursorRaw);
-    tableIndex = cursor.tableIndex;
-    offset = cursor.offset;
-    syncStartedAt = cursor.syncStartedAt;
-  }
-
-  if (!syncStartedAt) {
-    syncStartedAt = ctx.now;
-  }
 
   // Advance until we fill the requested page budget or finish all tables.
   while (tableIndex < SYNCABLE_TABLES.length && pagesCollected < pageCount) {
@@ -1186,12 +1218,18 @@ async function processInitialSyncPaged(
       offset,
       pageSize
     );
+    const pageDurationMs = Date.now() - pageStartedAt;
     perfLogDuration(
       ctx.perfDebugEnabled,
       ctx.perfMinDurationMs,
-      Date.now() - pageStartedAt,
+      pageDurationMs,
       `initial.page table=${tableName} offset=${offset} limit=${pageSize} rows=${changes.length}`
     );
+    if (ctx.diagnosticsEnabled) {
+      diagnostics.push(
+        `[WorkerSyncDiag] initialPage table=${tableName} offset=${offset} limit=${pageSize} rows=${changes.length} durationMs=${pageDurationMs}`
+      );
+    }
 
     if (changes.length === 0) {
       // Either table is empty / skipped OR we've paged past the end.
@@ -1222,6 +1260,7 @@ async function processInitialSyncPaged(
       { tableIndex, offset },
       syncStartedAt
     ),
+    diagnostics,
   };
 }
 
@@ -1398,6 +1437,7 @@ interface SyncTransactionResult {
   responseChanges: SyncChange[];
   nextCursor?: string;
   syncStartedAt?: string;
+  diagnostics?: string[];
 }
 
 function getCursorSummary(payload: SyncRequest): string {
@@ -1554,6 +1594,7 @@ async function processPullForSync(
     responseChanges: page.changes,
     nextCursor: page.nextCursor,
     syncStartedAt: page.syncStartedAt,
+    diagnostics: page.diagnostics,
   };
 }
 
@@ -1620,6 +1661,9 @@ async function runSyncTransaction(params: {
   );
 
   if (params.diagnosticsEnabled) {
+    if (result.diagnostics) {
+      params.diag.push(...result.diagnostics);
+    }
     addResponseDiagnostics(
       params.diag,
       result.responseChanges,
