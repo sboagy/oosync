@@ -12,7 +12,7 @@
 import type { SyncChange, SyncRequestOverrides } from "@oosync/shared/protocol";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { IRawSqliteExecResult } from "../runtime/sqlite-wasm-adapter";
-import { getAdapter, type SyncableTableName } from "./adapters";
+import { getAdapter } from "./adapters";
 import { applyRemoteChangesToLocalDb } from "./apply-remote-changes";
 import {
   backfillOutboxSince,
@@ -62,6 +62,7 @@ function getRuntimeState() {
 const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
 
 const INITIAL_SYNC_PAGE_SIZE = 200;
+const INITIAL_SYNC_PAGE_COUNT = 16;
 const MIN_INITIAL_SYNC_PAGE_SIZE = 25;
 
 /** LocalStorage key prefix for persisting last sync timestamp across app restarts */
@@ -213,12 +214,12 @@ function sortOutboxItemsByDependency(items: OutboxItem[]): OutboxItem[] {
  * ```
  */
 export class SyncEngine {
-  private localDb: SqliteDatabase;
-  private supabase: SupabaseClient;
-  private config: SyncConfig;
+  private readonly localDb: SqliteDatabase;
+  private readonly supabase: SupabaseClient;
+  private readonly config: SyncConfig;
   private lastSyncTimestamp: string | null = null;
-  private userId: string;
-  private deviceId: string;
+  private readonly userId: string;
+  private readonly deviceId: string;
 
   /** Get the user-specific localStorage key for sync timestamp */
   private get syncTimestampKey(): string {
@@ -312,6 +313,7 @@ export class SyncEngine {
           pullCursor,
           syncStartedAt,
           pageSize: candidatePageSize,
+          initialPageCount: INITIAL_SYNC_PAGE_COUNT,
           overrides: requestOverrides ?? undefined,
         });
 
@@ -348,7 +350,7 @@ export class SyncEngine {
   /**
    * Bidirectional sync with Cloudflare Worker
    */
-  async syncWithWorker(options?: {
+  async /* NOSONAR - sync orchestration is intentionally centralized; split after batching work stabilizes. */ syncWithWorker(options?: {
     allowDeletes?: boolean;
     pullOnly?: boolean;
     requestOverrides?: SyncRequestOverrides | null;
@@ -413,7 +415,7 @@ export class SyncEngine {
       const outboxItemsToComplete: OutboxItem[] = [];
 
       for (const item of sortedItems) {
-        const adapter = getAdapter(item.tableName as SyncableTableName);
+        const adapter = getAdapter(item.tableName);
 
         if (item.operation.toLowerCase() === "delete") {
           if (!allowDeletes) {
@@ -446,7 +448,7 @@ export class SyncEngine {
           // INSERT/UPDATE
           const localRow = await fetchLocalRowByPrimaryKey(
             this.localDb,
-            item.tableName as SyncableTableName,
+            item.tableName,
             item.rowId
           );
 
@@ -548,6 +550,7 @@ export class SyncEngine {
             this.lastSyncTimestamp || undefined,
             {
               pageSize: INITIAL_SYNC_PAGE_SIZE,
+              initialPageCount: INITIAL_SYNC_PAGE_COUNT,
               overrides: requestOverrides ?? undefined,
             }
           );
@@ -641,7 +644,7 @@ export class SyncEngine {
         const localCountErrorsLogged = new Set<string>();
         if (sqliteDb) {
           for (const [table] of sortedTables) {
-            if (!syncableTables.includes(table as SyncableTableName)) {
+            if (!syncableTables.includes(table)) {
               continue;
             }
             try {

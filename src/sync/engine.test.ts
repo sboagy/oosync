@@ -134,6 +134,9 @@ describe("SyncEngine initial sync paging", () => {
     expect(workerSyncMock.mock.calls.map((call) => call[2]?.pageSize)).toEqual([
       200, 100, 100,
     ]);
+    expect(
+      workerSyncMock.mock.calls.map((call) => call[2]?.initialPageCount)
+    ).toEqual([16, 16, 16]);
     expect(localStorage.setItem).toHaveBeenCalledWith(
       "TT_LAST_SYNC_TIMESTAMP_user-1",
       "2024-01-01T00:00:00.000Z"
@@ -157,6 +160,7 @@ describe("SyncEngine initial sync paging", () => {
     expect(result.success).toBe(false);
     expect(workerSyncMock).toHaveBeenCalledTimes(1);
     expect(workerSyncMock.mock.calls[0][2]?.pageSize).toBe(200);
+    expect(workerSyncMock.mock.calls[0][2]?.initialPageCount).toBe(16);
     expect(result.errors[0]).toContain("Sync failed: 400");
   });
 });

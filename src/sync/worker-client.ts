@@ -7,13 +7,10 @@ import type {
 
 const WORKER_URL = import.meta.env.VITE_WORKER_URL || "http://localhost:8787";
 const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
+const DEFAULT_INITIAL_PAGE_COUNT = 16;
 
 export class WorkerClient {
-  private token: string;
-
-  constructor(token: string) {
-    this.token = token;
-  }
+  constructor(private readonly token: string) {}
 
   async sync(
     changes: SyncChange[],
@@ -22,10 +19,14 @@ export class WorkerClient {
       pullCursor?: string;
       syncStartedAt?: string;
       pageSize?: number;
+      initialPageCount?: number;
       overrides?: SyncRequestOverrides | null;
     }
   ): Promise<SyncResponse> {
     const overrides = options?.overrides ?? undefined;
+    const initialPageCount =
+      options?.initialPageCount ??
+      (lastSyncAt ? undefined : DEFAULT_INITIAL_PAGE_COUNT);
     const payload: SyncRequest = {
       changes,
       lastSyncAt,
@@ -33,6 +34,7 @@ export class WorkerClient {
       pullCursor: options?.pullCursor,
       syncStartedAt: options?.syncStartedAt,
       pageSize: options?.pageSize,
+      initialPageCount,
       collectionsOverride: overrides?.collectionsOverride,
       rpcParamOverrides: overrides?.rpcParamOverrides,
       pullTables: overrides?.pullTables,

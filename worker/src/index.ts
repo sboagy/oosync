@@ -357,6 +357,11 @@ interface InitialSyncCursorV1 {
   syncStartedAt: string;
 }
 
+interface InitialSyncPageState {
+  tableIndex: number;
+  offset: number;
+}
+
 function encodeCursor(cursor: InitialSyncCursorV1): string {
   return btoa(JSON.stringify(cursor));
 }
@@ -390,6 +395,22 @@ function decodeCursor(raw: string): InitialSyncCursorV1 {
   }
 
   return { v: 1, tableIndex, offset, syncStartedAt };
+}
+
+function encodeNextInitialSyncCursor(
+  state: InitialSyncPageState,
+  syncStartedAt: string
+): string | undefined {
+  if (state.tableIndex >= SYNCABLE_TABLES.length) {
+    return undefined;
+  }
+
+  return encodeCursor({
+    v: 1,
+    tableIndex: state.tableIndex,
+    offset: state.offset,
+    syncStartedAt,
+  });
 }
 
 type DrizzleColumn = AnyPgColumn;
@@ -1109,7 +1130,8 @@ async function processInitialSyncPaged(
   ctx: SyncContext,
   cursorRaw: string | undefined,
   syncStartedAtHint: string | undefined,
-  pageSizeHint: number | undefined
+  pageSizeHint: number | undefined,
+  pageCountHint: number | undefined
 ): Promise<{
   changes: SyncChange[];
   nextCursor?: string;
@@ -1117,15 +1139,24 @@ async function processInitialSyncPaged(
 }> {
   const MAX_PAGE_SIZE = 500;
   const DEFAULT_PAGE_SIZE = 500;
+  const MAX_PAGE_COUNT = 32;
+  const DEFAULT_PAGE_COUNT = 1;
   const requested =
     typeof pageSizeHint === "number" && Number.isFinite(pageSizeHint)
       ? Math.max(1, Math.floor(pageSizeHint))
       : DEFAULT_PAGE_SIZE;
   const pageSize = Math.min(requested, MAX_PAGE_SIZE);
+  const requestedPageCount =
+    typeof pageCountHint === "number" && Number.isFinite(pageCountHint)
+      ? Math.max(1, Math.floor(pageCountHint))
+      : DEFAULT_PAGE_COUNT;
+  const pageCount = Math.min(requestedPageCount, MAX_PAGE_COUNT);
 
   let tableIndex = 0;
   let offset = 0;
   let syncStartedAt = syncStartedAtHint;
+  const allChanges: SyncChange[] = [];
+  let pagesCollected = 0;
 
   if (cursorRaw) {
     const cursor = decodeCursor(cursorRaw);
@@ -1138,8 +1169,8 @@ async function processInitialSyncPaged(
     syncStartedAt = ctx.now;
   }
 
-  // Advance until we find a table with rows to return, or we finish.
-  while (tableIndex < SYNCABLE_TABLES.length) {
+  // Advance until we fill the requested page budget or finish all tables.
+  while (tableIndex < SYNCABLE_TABLES.length && pagesCollected < pageCount) {
     const tableName = SYNCABLE_TABLES[tableIndex];
     if (ctx.pullTables && !ctx.pullTables.has(tableName)) {
       tableIndex += 1;
@@ -1172,37 +1203,26 @@ async function processInitialSyncPaged(
 
     const nextOffset = offset + changes.length;
     const isLastPageForTable = changes.length < pageSize;
+    allChanges.push(...changes);
+    pagesCollected += 1;
 
     if (isLastPageForTable) {
-      const nextTableIndex = tableIndex + 1;
-      if (nextTableIndex >= SYNCABLE_TABLES.length) {
-        return { changes, syncStartedAt };
-      }
-      return {
-        changes,
-        syncStartedAt,
-        nextCursor: encodeCursor({
-          v: 1,
-          tableIndex: nextTableIndex,
-          offset: 0,
-          syncStartedAt,
-        }),
-      };
+      tableIndex += 1;
+      offset = 0;
+      continue;
     }
 
-    return {
-      changes,
-      syncStartedAt,
-      nextCursor: encodeCursor({
-        v: 1,
-        tableIndex,
-        offset: nextOffset,
-        syncStartedAt,
-      }),
-    };
+    offset = nextOffset;
   }
 
-  return { changes: [], syncStartedAt };
+  return {
+    changes: allChanges,
+    syncStartedAt,
+    nextCursor: encodeNextInitialSyncCursor(
+      { tableIndex, offset },
+      syncStartedAt
+    ),
+  };
 }
 
 // ============================================================================
@@ -1399,7 +1419,7 @@ function addStartDiagnostics(
   syncType: SyncType
 ): void {
   diag.push(
-    `[WorkerSyncDiag] type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} ${getCursorSummary(payload)}`
+    `[WorkerSyncDiag] type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} initialPageCount=${payload.initialPageCount ?? "null"} ${getCursorSummary(payload)}`
   );
 }
 
@@ -1521,13 +1541,14 @@ async function processPullForSync(
     ctx,
     payload.pullCursor,
     payload.syncStartedAt,
-    payload.pageSize
+    payload.pageSize,
+    payload.initialPageCount
   );
   perfLogDuration(
     perfDebugEnabled,
     perfMinDurationMs,
     Date.now() - pullStartedAt,
-    `sync.pull.initial pageChanges=${page.changes.length} nextCursor=${page.nextCursor ? "yes" : "no"}`
+    `sync.pull.initial pageChanges=${page.changes.length} pageCount=${payload.initialPageCount ?? "default"} nextCursor=${page.nextCursor ? "yes" : "no"}`
   );
   return {
     responseChanges: page.changes,
@@ -1637,7 +1658,7 @@ async function handleSync(
 
   perfLog(
     perfDebugEnabled,
-    `sync.start type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} hasCursor=${payload.pullCursor ? "yes" : "no"}`
+    `sync.start type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} initialPageCount=${payload.initialPageCount ?? "null"} hasCursor=${payload.pullCursor ? "yes" : "no"}`
   );
 
   if (diagnosticsEnabled) {
@@ -1709,8 +1730,8 @@ function getCorsHeaders(request: Request): Record<string, string> {
 
 function jsonResponse(
   data: unknown,
-  status = 200,
-  corsHeaders: Record<string, string>
+  corsHeaders: Record<string, string>,
+  status = 200
 ): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -1720,10 +1741,10 @@ function jsonResponse(
 
 function errorResponse(
   message: string,
-  status = 500,
-  corsHeaders: Record<string, string>
+  corsHeaders: Record<string, string>,
+  status = 500
 ): Response {
-  return jsonResponse({ error: message }, status, corsHeaders);
+  return jsonResponse({ error: message }, corsHeaders, status);
 }
 
 async function fetch(request: Request, env: Env): Promise<Response> {
@@ -1774,7 +1795,7 @@ async function fetch(request: Request, env: Env): Promise<Response> {
       );
       if (!userId) {
         debug.log(`[HTTP] Unauthorized - JWT verification failed`);
-        return errorResponse("Unauthorized", 401, corsHeaders);
+        return errorResponse("Unauthorized", corsHeaders, 401);
       }
 
       const diagnosticsEnabled =
@@ -1838,7 +1859,7 @@ async function fetch(request: Request, env: Env): Promise<Response> {
           "http.sync.request.total"
         );
         debug.log(`[HTTP] Sync completed successfully`);
-        return jsonResponse(response, 200, corsHeaders);
+        return jsonResponse(response, corsHeaders);
       } catch (error) {
         perfLogDuration(
           perfDebugEnabled,
@@ -1847,13 +1868,13 @@ async function fetch(request: Request, env: Env): Promise<Response> {
           "http.sync.request.failed"
         );
         console.error("[HTTP] Sync error:", error);
-        return errorResponse(formatDbError(error), 500, corsHeaders);
+        return errorResponse(formatDbError(error), corsHeaders);
       }
     }
 
     return new Response("Not Found", { status: 404, headers: corsHeaders });
   } catch (error) {
     console.error("[HTTP] Unhandled error:", error);
-    return errorResponse("Internal Server Error", 500, corsHeaders);
+    return errorResponse("Internal Server Error", corsHeaders);
   }
 }

@@ -6,9 +6,7 @@
  * and response, preventing protocol mismatches.
  */
 
-export type TableName = string;
-
-export interface SyncChange<TTableName extends string = TableName> {
+export interface SyncChange<TTableName extends string = string> {
   table: TTableName;
   rowId: string; // UUID or JSON composite key
   data: Record<string, unknown>; // The full row data
@@ -29,7 +27,7 @@ export interface SyncRequestOverrides {
   pullTables?: string[];
 }
 
-export interface SyncRequest<TTableName extends string = TableName> {
+export interface SyncRequest<TTableName extends string = string> {
   changes: Array<SyncChange<TTableName>>;
   lastSyncAt?: string; // ISO timestamp of last successful sync
   schemaVersion: number;
@@ -52,6 +50,13 @@ export interface SyncRequest<TTableName extends string = TableName> {
    */
   pageSize?: number;
 
+  /**
+   * Optional number of initial-sync table pages to coalesce into one response.
+   * The worker may clamp this to a safe maximum. Omit or set to 1 for the
+   * legacy one-table-page-per-response behavior.
+   */
+  initialPageCount?: number;
+
   /** Optional per-request collection values keyed by collection name. */
   collectionsOverride?: SyncCollectionsOverride;
   /** Optional per-request RPC param overrides keyed by RPC function name. */
@@ -60,7 +65,7 @@ export interface SyncRequest<TTableName extends string = TableName> {
   pullTables?: string[];
 }
 
-export interface SyncResponse<TTableName extends string = TableName> {
+export interface SyncResponse<TTableName extends string = string> {
   changes: Array<SyncChange<TTableName>>;
   syncedAt: string; // ISO timestamp of this sync
   error?: string;
