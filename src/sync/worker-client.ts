@@ -10,7 +10,11 @@ const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
 const DEFAULT_INITIAL_PAGE_COUNT = 16;
 
 export class WorkerClient {
-  constructor(private readonly token: string) {}
+  private readonly authToken: string;
+
+  constructor(token: string) {
+    this.authToken = token;
+  }
 
   async sync(
     changes: SyncChange[],
@@ -44,7 +48,7 @@ export class WorkerClient {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
+        Authorization: `Bearer ${this.authToken}`,
       },
       body: JSON.stringify(payload),
     });
