@@ -4,6 +4,7 @@ import * as path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { orderSyncableTablesByDependency } from "./codegen/table-order";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2415,8 +2416,8 @@ function buildSchemaTs(params: {
     "text",
     "uniqueIndex",
   ] as const;
-  const usedBuilders = ALL_SQLITE_BUILDERS.filter(
-    (b) => new RegExp(String.raw`\b${b}\(`).test(tableContent)
+  const usedBuilders = ALL_SQLITE_BUILDERS.filter((b) =>
+    new RegExp(String.raw`\b${b}\(`).test(tableContent)
   );
 
   return [
@@ -3026,17 +3027,6 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
     columnDescriptionsByTable[row.table_name][row.column_name] = row.comment;
   }
 
-  const nextTableMeta = buildTableMetaTs({
-    schema: args.schema,
-    columns,
-    primaryKeys,
-    uniqueConstraints,
-    strict: args.strict,
-    syncableTables,
-    tableRegistryCore,
-    columnDescriptionsByTable,
-  });
-
   const changeCategoryByTable: Record<string, ChangeCategory> = {
     ...(config.tableMeta?.changeCategoryByTable ??
       EMPTY_CHANGE_CATEGORY_BY_TABLE),
@@ -3071,9 +3061,24 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
     foreignKeys,
     overrides: config.tableMeta?.tableSyncOrderOverrides ?? EMPTY_NUMBER_RECORD,
   });
+  const orderedSyncableTables = orderSyncableTablesByDependency({
+    syncableTables,
+    tableSyncOrder,
+  });
+
+  const nextTableMeta = buildTableMetaTs({
+    schema: args.schema,
+    columns,
+    primaryKeys,
+    uniqueConstraints,
+    strict: args.strict,
+    syncableTables: orderedSyncableTables,
+    tableRegistryCore,
+    columnDescriptionsByTable,
+  });
 
   const tableToSchemaKey = buildTableToSchemaKeyMap({
-    tables: syncableTables,
+    tables: orderedSyncableTables,
     overrides:
       config.tableMeta?.tableToSchemaKeyOverrides ?? EMPTY_STRING_RECORD,
   });
@@ -3084,7 +3089,7 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
       fromFile: outputAppTableMetaFile,
       toFile: outputTableMetaFile,
     }),
-    syncableTables,
+    syncableTables: orderedSyncableTables,
     changeCategoryByTable,
     normalizeDatetimeByTable,
     tableSyncOrder,
@@ -3100,7 +3105,7 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
   });
 
   const defaultWorkerConfig = buildDefaultWorkerConfig({
-    syncableTables,
+    syncableTables: orderedSyncableTables,
     columnsByTable,
     foreignKeys,
     tableRegistryCore,
