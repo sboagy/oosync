@@ -48,7 +48,10 @@ function notInitialized(name: string): never {
 
 let schemaTables: SchemaTables | null = null;
 let SYNCABLE_TABLES: readonly string[] = [];
-let TABLE_REGISTRY: Record<string, unknown> = {};
+let TABLE_REGISTRY: Record<
+  string,
+  { relationKind?: "table" | "view" | "materialized_view" | string }
+> = {};
 
 let getPrimaryKey: (tableName: string) => string | string[] = () =>
   notInitialized("getPrimaryKey");
@@ -348,6 +351,54 @@ interface SyncContext {
   diagnosticsEnabled: boolean;
   perfDebugEnabled: boolean;
   perfMinDurationMs: number;
+}
+
+interface InitialPullPage {
+  changes: SyncChange[];
+  diagnostics: string[];
+}
+
+function getRelationKind(tableName: string): string {
+  return TABLE_REGISTRY[tableName]?.relationKind ?? "relation";
+}
+
+function estimatePayloadBytes(changes: SyncChange[]): number {
+  return estimateJsonBytes(changes);
+}
+
+function estimateJsonBytes(value: unknown): number {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).length;
+  } catch {
+    return -1;
+  }
+}
+
+function createInitialPageDiagnostics(params: {
+  tableName: string;
+  ruleKind: string;
+  offset: number;
+  limit: number;
+  rows: number;
+  queryDurationMs: number;
+  transformDurationMs: number;
+  totalDurationMs: number;
+  payloadBytes: number;
+}): string {
+  return [
+    "[WorkerSyncDiag]",
+    "initialPage",
+    `relation=${params.tableName}`,
+    `kind=${getRelationKind(params.tableName)}`,
+    `rule=${params.ruleKind}`,
+    `offset=${params.offset}`,
+    `limit=${params.limit}`,
+    `rows=${params.rows}`,
+    `queryMs=${params.queryDurationMs}`,
+    `transformMs=${params.transformDurationMs}`,
+    `payloadBytes=${params.payloadBytes}`,
+    `totalMs=${params.totalDurationMs}`,
+  ].join(" ");
 }
 
 interface InitialSyncCursorV1 {
@@ -1094,13 +1145,14 @@ async function fetchTableForInitialSyncPage(
   syncStartedAt: string,
   offset: number,
   limit: number
-): Promise<SyncChange[]> {
+): Promise<InitialPullPage> {
+  const startedAt = Date.now();
   const table = getSchemaTables()[tableName];
-  if (!table) return [];
+  if (!table) return { changes: [], diagnostics: [] };
 
   const t = table;
   const meta = TABLE_REGISTRY[tableName];
-  if (!meta) return [];
+  if (!meta) return { changes: [], diagnostics: [] };
 
   // Check if table uses RPC for filtering
   const rule = getPullRule(tableName);
@@ -1114,12 +1166,15 @@ async function fetchTableForInitialSyncPage(
       pageOffset: offset,
     });
 
+    const queryStartedAt = Date.now();
     const rows = await fetchViaRPC(tx, rule.functionName, rpcParams);
+    const queryDurationMs = Date.now() - queryStartedAt;
 
     debug.log(
       `[PULL:INITIAL] ${tableName} (RPC): fetched ${rows.length} rows via ${rule.functionName}`
     );
 
+    const transformStartedAt = Date.now();
     const changes: SyncChange[] = [];
     for (const row of rows) {
       // Apply adapter transformation: Postgres (snake_case) -> Client (camelCase)
@@ -1127,7 +1182,24 @@ async function fetchTableForInitialSyncPage(
       const rowId = extractRowId(tableName, transformed, t);
       changes.push(rowToSyncChange(tableName, rowId, transformed));
     }
-    return changes;
+    const transformDurationMs = Date.now() - transformStartedAt;
+    const totalDurationMs = Date.now() - startedAt;
+    return {
+      changes,
+      diagnostics: [
+        createInitialPageDiagnostics({
+          tableName,
+          ruleKind: `rpc:${rule.functionName}`,
+          offset,
+          limit,
+          rows: changes.length,
+          queryDurationMs,
+          transformDurationMs,
+          totalDurationMs,
+          payloadBytes: estimatePayloadBytes(changes),
+        }),
+      ],
+    };
   }
 
   // Standard SQL-based fetch (non-RPC tables)
@@ -1141,7 +1213,22 @@ async function fetchTableForInitialSyncPage(
     debug.log(
       `[PULL:INITIAL] Skipping ${tableName} (no matching rows for user)`
     );
-    return [];
+    return {
+      changes: [],
+      diagnostics: [
+        createInitialPageDiagnostics({
+          tableName,
+          ruleKind: "skipped:no-filter-match",
+          offset,
+          limit,
+          rows: 0,
+          queryDurationMs: 0,
+          transformDurationMs: 0,
+          totalDurationMs: Date.now() - startedAt,
+          payloadBytes: 0,
+        }),
+      ],
+    };
   }
 
   const whereConditions: unknown[] = [...conditions];
@@ -1158,19 +1245,39 @@ async function fetchTableForInitialSyncPage(
     query = query.where(and(...whereConditions));
   }
 
+  const queryStartedAt = Date.now();
   const rows = await query.limit(limit).offset(offset);
+  const queryDurationMs = Date.now() - queryStartedAt;
 
   debug.log(
     `[PULL:INITIAL] ${tableName}: fetched page rows=${rows.length} offset=${offset} limit=${limit}`
   );
 
+  const transformStartedAt = Date.now();
   const changes: SyncChange[] = [];
   for (const row of rows) {
     const r = row;
     const rowId = extractRowId(tableName, r, t);
     changes.push(rowToSyncChange(tableName, rowId, r));
   }
-  return changes;
+  const transformDurationMs = Date.now() - transformStartedAt;
+  const totalDurationMs = Date.now() - startedAt;
+  return {
+    changes,
+    diagnostics: [
+      createInitialPageDiagnostics({
+        tableName,
+        ruleKind: rule?.kind ?? "default",
+        offset,
+        limit,
+        rows: changes.length,
+        queryDurationMs,
+        transformDurationMs,
+        totalDurationMs,
+        payloadBytes: estimatePayloadBytes(changes),
+      }),
+    ],
+  };
 }
 
 async function processInitialSyncPaged(
@@ -1210,7 +1317,7 @@ async function processInitialSyncPaged(
       continue;
     }
     const pageStartedAt = Date.now();
-    const changes = await fetchTableForInitialSyncPage(
+    const page = await fetchTableForInitialSyncPage(
       tx,
       tableName,
       ctx,
@@ -1218,17 +1325,16 @@ async function processInitialSyncPaged(
       offset,
       pageSize
     );
+    const { changes } = page;
     const pageDurationMs = Date.now() - pageStartedAt;
     perfLogDuration(
       ctx.perfDebugEnabled,
       ctx.perfMinDurationMs,
       pageDurationMs,
-      `initial.page table=${tableName} offset=${offset} limit=${pageSize} rows=${changes.length}`
+      `initial.page relation=${tableName} kind=${getRelationKind(tableName)} offset=${offset} limit=${pageSize} rows=${changes.length}`
     );
     if (ctx.diagnosticsEnabled) {
-      diagnostics.push(
-        `[WorkerSyncDiag] initialPage table=${tableName} offset=${offset} limit=${pageSize} rows=${changes.length} durationMs=${pageDurationMs}`
-      );
+      diagnostics.push(...page.diagnostics);
     }
 
     if (changes.length === 0) {
@@ -1479,7 +1585,7 @@ function addResponseDiagnostics(
     .map(([tableName, count]) => `${tableName}:${count}`)
     .join(",");
   diag.push(
-    `[WorkerSyncDiag] changesOut=${responseChanges.length} nextCursor=${nextCursor ? "yes" : "no"} syncStartedAt=${syncStartedAt ?? "null"} topTables=${top || "(none)"}`
+    `[WorkerSyncDiag] changesOut=${responseChanges.length} payloadBytes=${estimatePayloadBytes(responseChanges)} nextCursor=${nextCursor ? "yes" : "no"} syncStartedAt=${syncStartedAt ?? "null"} topRelations=${top || "(none)"}`
   );
 }
 
@@ -1534,7 +1640,8 @@ async function loadCollectionsForSync(
   authUserId: string,
   payload: SyncRequest,
   perfDebugEnabled: boolean,
-  perfMinDurationMs: number
+  perfMinDurationMs: number,
+  diag?: string[]
 ): Promise<Record<string, Set<string>>> {
   const collectionsStartedAt = Date.now();
   const collections = await loadUserCollections({
@@ -1548,7 +1655,15 @@ async function loadCollectionsForSync(
     Date.now() - collectionsStartedAt,
     "sync.collections"
   );
+  diag?.push(
+    `[WorkerSyncDiag] collections loadMs=${Date.now() - collectionsStartedAt}`
+  );
   applyCollectionOverrides(collections, payload.collectionsOverride);
+  if (diag && payload.collectionsOverride) {
+    diag.push(
+      `[WorkerSyncDiag] collections overrideKeys=${Object.keys(payload.collectionsOverride).join(",") || "(none)"}`
+    );
+  }
   return collections;
 }
 
@@ -1616,7 +1731,8 @@ async function runSyncTransaction(params: {
     authUserId,
     params.payload,
     params.perfDebugEnabled,
-    params.perfMinDurationMs
+    params.perfMinDurationMs,
+    params.diagnosticsEnabled ? params.diag : undefined
   );
   const pullTables = buildPullTables(params.payload.pullTables);
   logPullTableMode(pullTables);
@@ -1649,7 +1765,8 @@ async function runSyncTransaction(params: {
     authUserId,
     params.payload,
     params.perfDebugEnabled,
-    params.perfMinDurationMs
+    params.perfMinDurationMs,
+    params.diagnosticsEnabled ? params.diag : undefined
   );
 
   const result = await processPullForSync(
@@ -1674,6 +1791,11 @@ async function runSyncTransaction(params: {
 
   // NO GARBAGE COLLECTION NEEDED!
   // sync_change_log now has at most ~20 rows (one per table)
+  if (params.diagnosticsEnabled) {
+    params.diag.push(
+      `[WorkerSyncDiag] transaction totalMs=${Date.now() - txStartedAt}`
+    );
+  }
   perfLogDuration(
     params.perfDebugEnabled,
     params.perfMinDurationMs,
@@ -1690,10 +1812,11 @@ async function handleSync(
   userId: string,
   diagnosticsEnabled: boolean,
   perfDebugEnabled: boolean,
-  perfMinDurationMs: number
+  perfMinDurationMs: number,
+  initialDiagnostics: string[] = []
 ): Promise<SyncResponse> {
   const now = new Date().toISOString();
-  const diag: string[] = [];
+  const diag: string[] = [...initialDiagnostics];
   let responseChanges: SyncChange[] = [];
   let nextCursor: string | undefined;
   let syncStartedAt: string | undefined;
@@ -1741,6 +1864,9 @@ async function handleSync(
     Date.now() - syncStartedAtMs,
     `sync.complete type=${syncType} changesOut=${responseChanges.length} total`
   );
+  if (diagnosticsEnabled) {
+    diag.push(`[WorkerSyncDiag] sync totalMs=${Date.now() - syncStartedAtMs}`);
+  }
 
   return {
     changes: responseChanges,
@@ -1831,10 +1957,11 @@ async function fetch(request: Request, env: Env): Promise<Response> {
         env.SUPABASE_JWT_SECRET,
         env.SUPABASE_URL
       );
+      const authDurationMs = Date.now() - authStartedAt;
       perfLogDuration(
         perfDebugEnabled,
         perfMinDurationMs,
-        Date.now() - authStartedAt,
+        authDurationMs,
         `http.sync.auth authorized=${userId ? "yes" : "no"}`
       );
       if (!userId) {
@@ -1842,17 +1969,24 @@ async function fetch(request: Request, env: Env): Promise<Response> {
         return errorResponse("Unauthorized", corsHeaders, 401);
       }
 
-      const diagnosticsEnabled =
+      const payloadStartedAt = Date.now();
+      const payload: SyncRequest = await request.json();
+      const payloadParseDurationMs = Date.now() - payloadStartedAt;
+      const diagnosticsAllowed =
         env.SYNC_DIAGNOSTICS === "true" &&
         (!env.SYNC_DIAGNOSTICS_USER_ID ||
           env.SYNC_DIAGNOSTICS_USER_ID === userId);
-
-      const payloadStartedAt = Date.now();
-      const payload: SyncRequest = await request.json();
+      const diagnosticsEnabled =
+        diagnosticsAllowed && payload.diagnostics === true;
+      const requestDiagnostics = diagnosticsEnabled
+        ? [
+            `[WorkerSyncDiag] http authMs=${authDurationMs} payloadParseMs=${payloadParseDurationMs}`,
+          ]
+        : [];
       perfLogDuration(
         perfDebugEnabled,
         perfMinDurationMs,
-        Date.now() - payloadStartedAt,
+        payloadParseDurationMs,
         `http.sync.payload.parse changesIn=${payload.changes.length}`
       );
 
@@ -1861,14 +1995,21 @@ async function fetch(request: Request, env: Env): Promise<Response> {
         debug.log(`[HTTP] Sync request parsed, calling handleSync`);
         const createDbStartedAt = Date.now();
         const { db, close } = createDb(env);
+        const dbCreateDurationMs = Date.now() - createDbStartedAt;
+        if (diagnosticsEnabled) {
+          requestDiagnostics.push(
+            `[WorkerSyncDiag] http dbCreateMs=${dbCreateDurationMs}`
+          );
+        }
         perfLogDuration(
           perfDebugEnabled,
           perfMinDurationMs,
-          Date.now() - createDbStartedAt,
+          dbCreateDurationMs,
           "http.sync.db.create"
         );
 
         const handleSyncStartedAt = Date.now();
+        let dbCloseDurationMs: number | undefined;
         const response = await (async () => {
           try {
             return await handleSync(
@@ -1877,19 +2018,30 @@ async function fetch(request: Request, env: Env): Promise<Response> {
               userId,
               diagnosticsEnabled,
               perfDebugEnabled,
-              perfMinDurationMs
+              perfMinDurationMs,
+              requestDiagnostics
             );
           } finally {
             const closeStartedAt = Date.now();
             await close();
+            dbCloseDurationMs = Date.now() - closeStartedAt;
             perfLogDuration(
               perfDebugEnabled,
               perfMinDurationMs,
-              Date.now() - closeStartedAt,
+              dbCloseDurationMs,
               "http.sync.db.close"
             );
           }
         })();
+        if (diagnosticsEnabled) {
+          response.debug ??= [];
+          response.debug.push(
+            `[WorkerSyncDiag] http dbCloseMs=${dbCloseDurationMs ?? "unknown"}`
+          );
+          response.debug.push(
+            `[WorkerSyncDiag] http handleMs=${Date.now() - handleSyncStartedAt} requestTotalMs=${Date.now() - requestStartedAt} responseBytesApprox=${estimateJsonBytes(response)}`
+          );
+        }
         perfLogDuration(
           perfDebugEnabled,
           perfMinDurationMs,

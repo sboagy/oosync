@@ -4,6 +4,7 @@ import { WorkerClient } from "./worker-client";
 const fetchMock = vi.fn();
 
 beforeEach(() => {
+  vi.unstubAllGlobals();
   fetchMock.mockReset();
   fetchMock.mockResolvedValue({
     ok: true,
@@ -36,5 +37,20 @@ describe("WorkerClient initial pull batching", () => {
     await client.sync([], "2024-01-01T00:00:00.000Z");
 
     expect(getRequestPayload()).not.toHaveProperty("initialPageCount");
+  });
+
+  it("requests diagnostics when enabled by the runtime URL", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.stubGlobal("window", {
+      location: {
+        search: "?ttSyncDiagnostics=1",
+      },
+    });
+    const client = new WorkerClient("token");
+
+    await client.sync([]);
+
+    expect(getRequestPayload().diagnostics).toBe(true);
+    logSpy.mockRestore();
   });
 });

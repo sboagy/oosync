@@ -63,12 +63,23 @@ export interface SyncRequest<TTableName extends string = string> {
   rpcParamOverrides?: SyncRpcParamOverrides;
   /** Optional allowlist of tables to pull for this sync. */
   pullTables?: string[];
+
+  /**
+   * Optional request-scoped diagnostics hint. Workers may ignore this unless
+   * diagnostics are allowed by environment/configuration.
+   */
+  diagnostics?: boolean;
 }
 
 export interface SyncResponse<TTableName extends string = string> {
   changes: Array<SyncChange<TTableName>>;
   syncedAt: string; // ISO timestamp of this sync
   error?: string;
+  /**
+   * Human-readable diagnostic lines emitted only when diagnostics are enabled.
+   * These lines are not part of sync correctness and may change between
+   * versions; consumers should log them rather than parse them for behavior.
+   */
   debug?: string[];
 
   /**

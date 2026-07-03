@@ -9,6 +9,23 @@ const WORKER_URL = import.meta.env.VITE_WORKER_URL || "http://localhost:8787";
 const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
 const DEFAULT_INITIAL_PAGE_COUNT = 16;
 
+function isRuntimeDiagnosticsEnabled(): boolean {
+  if (SYNC_DIAGNOSTICS) {
+    return true;
+  }
+
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("ttSyncDiagnostics") === "1";
+  } catch {
+    return false;
+  }
+}
+
 export class WorkerClient {
   private readonly authToken: string;
 
@@ -31,6 +48,7 @@ export class WorkerClient {
     const initialPageCount =
       options?.initialPageCount ??
       (lastSyncAt ? undefined : DEFAULT_INITIAL_PAGE_COUNT);
+    const diagnosticsEnabled = isRuntimeDiagnosticsEnabled();
     const payload: SyncRequest = {
       changes,
       lastSyncAt,
@@ -42,6 +60,7 @@ export class WorkerClient {
       collectionsOverride: overrides?.collectionsOverride,
       rpcParamOverrides: overrides?.rpcParamOverrides,
       pullTables: overrides?.pullTables,
+      diagnostics: diagnosticsEnabled ? true : undefined,
     };
 
     const response = await fetch(`${WORKER_URL}/api/sync`, {
@@ -60,11 +79,11 @@ export class WorkerClient {
 
     const json = await response.json();
 
-    if (SYNC_DIAGNOSTICS) {
+    if (diagnosticsEnabled) {
       const total = Array.isArray(json.changes) ? json.changes.length : 0;
       console.log(`[WorkerClientDiag] response totalChanges=${total}`);
       if (Array.isArray(json.debug) && json.debug.length > 0) {
-        for (const line of json.debug.slice(0, 50)) {
+        for (const line of json.debug.slice(0, 200)) {
           console.log(`[WorkerClientDiag] worker: ${String(line)}`);
         }
       }
