@@ -353,6 +353,7 @@ interface SyncContext {
 interface InitialPullPage {
   changes: SyncChange[];
   diagnostics: string[];
+  timing?: InitialPageTiming;
 }
 
 function getRelationKind(tableName: string): string {
@@ -371,7 +372,30 @@ function estimateJsonBytes(value: unknown): number {
   }
 }
 
-function createInitialPageDiagnostics(params: {
+interface InitialPageTiming {
+  tableName: string;
+  relationKind: string;
+  ruleKind: string;
+  offset: number;
+  limit: number;
+  rows: number;
+  queryDurationMs: number;
+  transformDurationMs: number;
+  totalDurationMs: number;
+  payloadBytes: number;
+}
+
+interface InitialTimingAggregate {
+  pages: number;
+  relations: Set<string>;
+  rows: number;
+  queryDurationMs: number;
+  transformDurationMs: number;
+  totalDurationMs: number;
+  payloadBytes: number;
+}
+
+function createInitialPageTiming(params: {
   tableName: string;
   ruleKind: string;
   offset: number;
@@ -381,21 +405,96 @@ function createInitialPageDiagnostics(params: {
   transformDurationMs: number;
   totalDurationMs: number;
   payloadBytes: number;
-}): string {
+}): InitialPageTiming {
+  return {
+    ...params,
+    relationKind: getRelationKind(params.tableName),
+  };
+}
+
+function createInitialPageDiagnostics(timing: InitialPageTiming): string {
   return [
     "[WorkerSyncDiag]",
     "initialPage",
-    `relation=${params.tableName}`,
-    `kind=${getRelationKind(params.tableName)}`,
-    `rule=${params.ruleKind}`,
-    `offset=${params.offset}`,
-    `limit=${params.limit}`,
-    `rows=${params.rows}`,
-    `queryMs=${params.queryDurationMs}`,
-    `transformMs=${params.transformDurationMs}`,
-    `payloadBytes=${params.payloadBytes}`,
-    `totalMs=${params.totalDurationMs}`,
+    `relation=${timing.tableName}`,
+    `kind=${timing.relationKind}`,
+    `rule=${timing.ruleKind}`,
+    `offset=${timing.offset}`,
+    `limit=${timing.limit}`,
+    `rows=${timing.rows}`,
+    `queryMs=${timing.queryDurationMs}`,
+    `transformMs=${timing.transformDurationMs}`,
+    `payloadBytes=${timing.payloadBytes}`,
+    `totalMs=${timing.totalDurationMs}`,
   ].join(" ");
+}
+
+function addInitialTimingAggregate(
+  aggregates: Map<string, InitialTimingAggregate>,
+  timing: InitialPageTiming
+): void {
+  const aggregate = aggregates.get(timing.relationKind) ?? {
+    pages: 0,
+    relations: new Set<string>(),
+    rows: 0,
+    queryDurationMs: 0,
+    transformDurationMs: 0,
+    totalDurationMs: 0,
+    payloadBytes: 0,
+  };
+  aggregate.pages += 1;
+  aggregate.relations.add(timing.tableName);
+  aggregate.rows += timing.rows;
+  aggregate.queryDurationMs += timing.queryDurationMs;
+  aggregate.transformDurationMs += timing.transformDurationMs;
+  aggregate.totalDurationMs += timing.totalDurationMs;
+  aggregate.payloadBytes += timing.payloadBytes;
+  aggregates.set(timing.relationKind, aggregate);
+}
+
+function createInitialKindDiagnostics(
+  aggregates: Map<string, InitialTimingAggregate>
+): string[] {
+  return [...aggregates.entries()]
+    .sort(([kindA], [kindB]) => kindA.localeCompare(kindB))
+    .map(([kind, aggregate]) =>
+      [
+        "[WorkerSyncDiag]",
+        "initialKind",
+        `kind=${kind}`,
+        `pages=${aggregate.pages}`,
+        `relations=${aggregate.relations.size}`,
+        `rows=${aggregate.rows}`,
+        `queryMs=${aggregate.queryDurationMs}`,
+        `transformMs=${aggregate.transformDurationMs}`,
+        `payloadBytes=${aggregate.payloadBytes}`,
+        `totalMs=${aggregate.totalDurationMs}`,
+      ].join(" ")
+    );
+}
+
+function createInitialRelationTopDiagnostics(
+  timings: InitialPageTiming[]
+): string | undefined {
+  const top = [...timings]
+    .sort((a, b) => b.totalDurationMs - a.totalDurationMs)
+    .slice(0, 8)
+    .map((timing) =>
+      [
+        timing.tableName,
+        `kind=${timing.relationKind}`,
+        `totalMs=${timing.totalDurationMs}`,
+        `queryMs=${timing.queryDurationMs}`,
+        `rows=${timing.rows}`,
+        `payloadBytes=${timing.payloadBytes}`,
+      ].join(":")
+    )
+    .join(",");
+
+  if (!top) {
+    return undefined;
+  }
+  return `[WorkerSyncDiag] initialRelationTop sort=totalMs relations=${top}`;
 }
 
 interface InitialSyncCursorV1 {
@@ -1181,21 +1280,21 @@ async function fetchTableForInitialSyncPage(
     }
     const transformDurationMs = Date.now() - transformStartedAt;
     const totalDurationMs = Date.now() - startedAt;
+    const timing = createInitialPageTiming({
+      tableName,
+      ruleKind: `rpc:${rule.functionName}`,
+      offset,
+      limit,
+      rows: changes.length,
+      queryDurationMs,
+      transformDurationMs,
+      totalDurationMs,
+      payloadBytes: estimatePayloadBytes(changes),
+    });
     return {
       changes,
-      diagnostics: [
-        createInitialPageDiagnostics({
-          tableName,
-          ruleKind: `rpc:${rule.functionName}`,
-          offset,
-          limit,
-          rows: changes.length,
-          queryDurationMs,
-          transformDurationMs,
-          totalDurationMs,
-          payloadBytes: estimatePayloadBytes(changes),
-        }),
-      ],
+      diagnostics: [createInitialPageDiagnostics(timing)],
+      timing,
     };
   }
 
@@ -1210,21 +1309,21 @@ async function fetchTableForInitialSyncPage(
     debug.log(
       `[PULL:INITIAL] Skipping ${tableName} (no matching rows for user)`
     );
+    const timing = createInitialPageTiming({
+      tableName,
+      ruleKind: "skipped:no-filter-match",
+      offset,
+      limit,
+      rows: 0,
+      queryDurationMs: 0,
+      transformDurationMs: 0,
+      totalDurationMs: Date.now() - startedAt,
+      payloadBytes: 0,
+    });
     return {
       changes: [],
-      diagnostics: [
-        createInitialPageDiagnostics({
-          tableName,
-          ruleKind: "skipped:no-filter-match",
-          offset,
-          limit,
-          rows: 0,
-          queryDurationMs: 0,
-          transformDurationMs: 0,
-          totalDurationMs: Date.now() - startedAt,
-          payloadBytes: 0,
-        }),
-      ],
+      diagnostics: [createInitialPageDiagnostics(timing)],
+      timing,
     };
   }
 
@@ -1259,21 +1358,21 @@ async function fetchTableForInitialSyncPage(
   }
   const transformDurationMs = Date.now() - transformStartedAt;
   const totalDurationMs = Date.now() - startedAt;
+  const timing = createInitialPageTiming({
+    tableName,
+    ruleKind: rule?.kind ?? "default",
+    offset,
+    limit,
+    rows: changes.length,
+    queryDurationMs,
+    transformDurationMs,
+    totalDurationMs,
+    payloadBytes: estimatePayloadBytes(changes),
+  });
   return {
     changes,
-    diagnostics: [
-      createInitialPageDiagnostics({
-        tableName,
-        ruleKind: rule?.kind ?? "default",
-        offset,
-        limit,
-        rows: changes.length,
-        queryDurationMs,
-        transformDurationMs,
-        totalDurationMs,
-        payloadBytes: estimatePayloadBytes(changes),
-      }),
-    ],
+    diagnostics: [createInitialPageDiagnostics(timing)],
+    timing,
   };
 }
 
@@ -1303,6 +1402,8 @@ async function processInitialSyncPaged(
   const { syncStartedAt } = startState;
   const allChanges: SyncChange[] = [];
   const diagnostics: string[] = [];
+  const timings: InitialPageTiming[] = [];
+  const timingAggregates = new Map<string, InitialTimingAggregate>();
   let pagesCollected = 0;
 
   // Advance until we fill the requested page budget or finish all tables.
@@ -1332,6 +1433,10 @@ async function processInitialSyncPaged(
     );
     if (ctx.diagnosticsEnabled) {
       diagnostics.push(...page.diagnostics);
+      if (page.timing) {
+        timings.push(page.timing);
+        addInitialTimingAggregate(timingAggregates, page.timing);
+      }
     }
 
     if (changes.length === 0) {
@@ -1354,6 +1459,14 @@ async function processInitialSyncPaged(
     }
 
     offset = nextOffset;
+  }
+
+  if (ctx.diagnosticsEnabled) {
+    diagnostics.push(...createInitialKindDiagnostics(timingAggregates));
+    const topRelations = createInitialRelationTopDiagnostics(timings);
+    if (topRelations) {
+      diagnostics.push(topRelations);
+    }
   }
 
   return {
