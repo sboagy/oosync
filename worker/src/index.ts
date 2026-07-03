@@ -1667,6 +1667,35 @@ async function loadCollectionsForSync(
   return collections;
 }
 
+async function reloadCollectionsAfterPush(params: {
+  ctx: SyncContext;
+  tx: Transaction;
+  authUserId: string;
+  payload: SyncRequest;
+  diagnosticsEnabled: boolean;
+  diag: string[];
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+}): Promise<void> {
+  if (params.payload.changes.length === 0) {
+    if (params.diagnosticsEnabled) {
+      params.diag.push(
+        "[WorkerSyncDiag] collections reuseAfterPush=yes reason=no-changes"
+      );
+    }
+    return;
+  }
+
+  params.ctx.collections = await loadCollectionsForSync(
+    params.tx,
+    params.authUserId,
+    params.payload,
+    params.perfDebugEnabled,
+    params.perfMinDurationMs,
+    params.diagnosticsEnabled ? params.diag : undefined
+  );
+}
+
 async function processPullForSync(
   tx: Transaction,
   payload: SyncRequest,
@@ -1760,14 +1789,16 @@ async function runSyncTransaction(params: {
 
   // Reload collections after push so the pull phase sees any collection/ownership
   // changes written during the push (e.g. newly created rows in collection-backed tables).
-  ctx.collections = await loadCollectionsForSync(
-    params.tx,
+  await reloadCollectionsAfterPush({
+    ctx,
+    tx: params.tx,
     authUserId,
-    params.payload,
-    params.perfDebugEnabled,
-    params.perfMinDurationMs,
-    params.diagnosticsEnabled ? params.diag : undefined
-  );
+    payload: params.payload,
+    diagnosticsEnabled: params.diagnosticsEnabled,
+    diag: params.diag,
+    perfDebugEnabled: params.perfDebugEnabled,
+    perfMinDurationMs: params.perfMinDurationMs,
+  });
 
   const result = await processPullForSync(
     params.tx,
