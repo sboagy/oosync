@@ -33,29 +33,30 @@ function isRuntimeDiagnosticsEnabled(): boolean {
     return true;
   }
 
-  if (typeof window === "undefined") {
+  if (globalThis.window === undefined) {
     return false;
   }
 
   try {
-    const params = new URLSearchParams(window.location.search);
+    const { localStorage, location } = globalThis.window;
+    const params = new URLSearchParams(location.search);
     const queryFlag =
       parseDiagnosticsFlag(params.get("ttSyncDiagnostics")) ??
       parseDiagnosticsFlag(params.get("syncDiagnostics"));
     if (queryFlag !== null) {
-      window.localStorage.setItem(DIAGNOSTICS_STORAGE_KEY, String(queryFlag));
+      localStorage.setItem(DIAGNOSTICS_STORAGE_KEY, String(queryFlag));
       return queryFlag;
     }
 
     const storedFlag = parseDiagnosticsFlag(
-      window.localStorage.getItem(DIAGNOSTICS_STORAGE_KEY)
+      localStorage.getItem(DIAGNOSTICS_STORAGE_KEY)
     );
     if (storedFlag !== null) {
       return storedFlag;
     }
 
     return CONSUMER_DIAGNOSTICS_STORAGE_KEYS.some(
-      (key) => parseDiagnosticsFlag(window.localStorage.getItem(key)) === true
+      (key) => parseDiagnosticsFlag(localStorage.getItem(key)) === true
     );
   } catch {
     return false;

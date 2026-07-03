@@ -48,10 +48,7 @@ function notInitialized(name: string): never {
 
 let schemaTables: SchemaTables | null = null;
 let SYNCABLE_TABLES: readonly string[] = [];
-let TABLE_REGISTRY: Record<
-  string,
-  { relationKind?: "table" | "view" | "materialized_view" | string }
-> = {};
+let TABLE_REGISTRY: Record<string, { relationKind?: string }> = {};
 
 let getPrimaryKey: (tableName: string) => string | string[] = () =>
   notInitialized("getPrimaryKey");
@@ -1948,6 +1945,221 @@ function errorResponse(
   return jsonResponse({ error: message }, corsHeaders, status);
 }
 
+interface SyncPostRequestParams {
+  request: Request;
+  env: Env;
+  corsHeaders: Record<string, string>;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  requestStartedAt: number;
+}
+
+function isSyncDiagnosticsEnabled(
+  env: Env,
+  userId: string,
+  payload: SyncRequest
+): boolean {
+  return (
+    payload.diagnostics === true &&
+    env.SYNC_DIAGNOSTICS === "true" &&
+    (!env.SYNC_DIAGNOSTICS_USER_ID || env.SYNC_DIAGNOSTICS_USER_ID === userId)
+  );
+}
+
+async function authorizeSyncRequest(
+  request: Request,
+  env: Env,
+  perfDebugEnabled: boolean,
+  perfMinDurationMs: number
+): Promise<{ userId: string | null; authDurationMs: number }> {
+  const authStartedAt = Date.now();
+  const userId = await verifyJwt(
+    request,
+    env.SUPABASE_JWT_SECRET,
+    env.SUPABASE_URL
+  );
+  const authDurationMs = Date.now() - authStartedAt;
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    authDurationMs,
+    `http.sync.auth authorized=${userId ? "yes" : "no"}`
+  );
+  return { userId, authDurationMs };
+}
+
+async function parseSyncPayload(
+  request: Request,
+  perfDebugEnabled: boolean,
+  perfMinDurationMs: number
+): Promise<{ payload: SyncRequest; payloadParseDurationMs: number }> {
+  const payloadStartedAt = Date.now();
+  const payload: SyncRequest = await request.json();
+  const payloadParseDurationMs = Date.now() - payloadStartedAt;
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    payloadParseDurationMs,
+    `http.sync.payload.parse changesIn=${payload.changes.length}`
+  );
+  return { payload, payloadParseDurationMs };
+}
+
+function appendHttpDiagnostics(
+  response: SyncResponse,
+  dbCloseDurationMs: number | undefined,
+  handleSyncStartedAt: number,
+  requestStartedAt: number
+): void {
+  response.debug ??= [];
+  response.debug.push(
+    `[WorkerSyncDiag] http dbCloseMs=${dbCloseDurationMs ?? "unknown"}`,
+    `[WorkerSyncDiag] http handleMs=${Date.now() - handleSyncStartedAt} requestTotalMs=${Date.now() - requestStartedAt} responseBytesApprox=${estimateJsonBytes(response)}`
+  );
+}
+
+async function runSyncWithDb(params: {
+  env: Env;
+  payload: SyncRequest;
+  userId: string;
+  diagnosticsEnabled: boolean;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  requestDiagnostics: string[];
+}): Promise<{ response: SyncResponse; dbCloseDurationMs: number | undefined }> {
+  const {
+    env,
+    payload,
+    userId,
+    diagnosticsEnabled,
+    perfDebugEnabled,
+    perfMinDurationMs,
+    requestDiagnostics,
+  } = params;
+  debug.log(`[HTTP] Sync request parsed, calling handleSync`);
+  const createDbStartedAt = Date.now();
+  const { db, close } = createDb(env);
+  const dbCreateDurationMs = Date.now() - createDbStartedAt;
+  if (diagnosticsEnabled) {
+    requestDiagnostics.push(
+      `[WorkerSyncDiag] http dbCreateMs=${dbCreateDurationMs}`
+    );
+  }
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    dbCreateDurationMs,
+    "http.sync.db.create"
+  );
+
+  let dbCloseDurationMs: number | undefined;
+  let response: SyncResponse;
+  try {
+    response = await handleSync(
+      db,
+      payload,
+      userId,
+      diagnosticsEnabled,
+      perfDebugEnabled,
+      perfMinDurationMs,
+      requestDiagnostics
+    );
+  } finally {
+    const closeStartedAt = Date.now();
+    await close();
+    dbCloseDurationMs = Date.now() - closeStartedAt;
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      dbCloseDurationMs,
+      "http.sync.db.close"
+    );
+  }
+  return { response, dbCloseDurationMs };
+}
+
+async function handleSyncPostRequest(
+  params: SyncPostRequestParams
+): Promise<Response> {
+  const {
+    request,
+    env,
+    corsHeaders,
+    perfDebugEnabled,
+    perfMinDurationMs,
+    requestStartedAt,
+  } = params;
+  debug.log(`[HTTP] POST /api/sync received`);
+  perfLog(perfDebugEnabled, "http.sync.request.received");
+
+  const { userId, authDurationMs } = await authorizeSyncRequest(
+    request,
+    env,
+    perfDebugEnabled,
+    perfMinDurationMs
+  );
+  if (!userId) {
+    debug.log(`[HTTP] Unauthorized - JWT verification failed`);
+    return errorResponse("Unauthorized", corsHeaders, 401);
+  }
+
+  const { payload, payloadParseDurationMs } = await parseSyncPayload(
+    request,
+    perfDebugEnabled,
+    perfMinDurationMs
+  );
+  const diagnosticsEnabled = isSyncDiagnosticsEnabled(env, userId, payload);
+  const requestDiagnostics = diagnosticsEnabled
+    ? [
+        `[WorkerSyncDiag] http authMs=${authDurationMs} payloadParseMs=${payloadParseDurationMs}`,
+      ]
+    : [];
+
+  try {
+    const handleSyncStartedAt = Date.now();
+    const { response, dbCloseDurationMs } = await runSyncWithDb({
+      env,
+      payload,
+      userId,
+      diagnosticsEnabled,
+      perfDebugEnabled,
+      perfMinDurationMs,
+      requestDiagnostics,
+    });
+    if (diagnosticsEnabled) {
+      appendHttpDiagnostics(
+        response,
+        dbCloseDurationMs,
+        handleSyncStartedAt,
+        requestStartedAt
+      );
+    }
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - handleSyncStartedAt,
+      "http.sync.handle"
+    );
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - requestStartedAt,
+      "http.sync.request.total"
+    );
+    debug.log(`[HTTP] Sync completed successfully`);
+    return jsonResponse(response, corsHeaders);
+  } catch (error) {
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - requestStartedAt,
+      "http.sync.request.failed"
+    );
+    console.error("[HTTP] Sync error:", error);
+    return errorResponse(formatDbError(error), corsHeaders);
+  }
+}
+
 async function fetch(request: Request, env: Env): Promise<Response> {
   // Initialize debug logging based on environment variable
   setDebugEnabled(env);
@@ -1978,125 +2190,14 @@ async function fetch(request: Request, env: Env): Promise<Response> {
 
     // Sync endpoint
     if (request.method === "POST" && url.pathname === "/api/sync") {
-      debug.log(`[HTTP] POST /api/sync received`);
-      perfLog(perfDebugEnabled, "http.sync.request.received");
-
-      // Authenticate
-      const authStartedAt = Date.now();
-      const userId = await verifyJwt(
+      return await handleSyncPostRequest({
         request,
-        env.SUPABASE_JWT_SECRET,
-        env.SUPABASE_URL
-      );
-      const authDurationMs = Date.now() - authStartedAt;
-      perfLogDuration(
+        env,
+        corsHeaders,
         perfDebugEnabled,
         perfMinDurationMs,
-        authDurationMs,
-        `http.sync.auth authorized=${userId ? "yes" : "no"}`
-      );
-      if (!userId) {
-        debug.log(`[HTTP] Unauthorized - JWT verification failed`);
-        return errorResponse("Unauthorized", corsHeaders, 401);
-      }
-
-      const payloadStartedAt = Date.now();
-      const payload: SyncRequest = await request.json();
-      const payloadParseDurationMs = Date.now() - payloadStartedAt;
-      const diagnosticsAllowed =
-        env.SYNC_DIAGNOSTICS === "true" &&
-        (!env.SYNC_DIAGNOSTICS_USER_ID ||
-          env.SYNC_DIAGNOSTICS_USER_ID === userId);
-      const diagnosticsEnabled =
-        diagnosticsAllowed && payload.diagnostics === true;
-      const requestDiagnostics = diagnosticsEnabled
-        ? [
-            `[WorkerSyncDiag] http authMs=${authDurationMs} payloadParseMs=${payloadParseDurationMs}`,
-          ]
-        : [];
-      perfLogDuration(
-        perfDebugEnabled,
-        perfMinDurationMs,
-        payloadParseDurationMs,
-        `http.sync.payload.parse changesIn=${payload.changes.length}`
-      );
-
-      // Connect to database
-      try {
-        debug.log(`[HTTP] Sync request parsed, calling handleSync`);
-        const createDbStartedAt = Date.now();
-        const { db, close } = createDb(env);
-        const dbCreateDurationMs = Date.now() - createDbStartedAt;
-        if (diagnosticsEnabled) {
-          requestDiagnostics.push(
-            `[WorkerSyncDiag] http dbCreateMs=${dbCreateDurationMs}`
-          );
-        }
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          dbCreateDurationMs,
-          "http.sync.db.create"
-        );
-
-        const handleSyncStartedAt = Date.now();
-        let dbCloseDurationMs: number | undefined;
-        const response = await (async () => {
-          try {
-            return await handleSync(
-              db,
-              payload,
-              userId,
-              diagnosticsEnabled,
-              perfDebugEnabled,
-              perfMinDurationMs,
-              requestDiagnostics
-            );
-          } finally {
-            const closeStartedAt = Date.now();
-            await close();
-            dbCloseDurationMs = Date.now() - closeStartedAt;
-            perfLogDuration(
-              perfDebugEnabled,
-              perfMinDurationMs,
-              dbCloseDurationMs,
-              "http.sync.db.close"
-            );
-          }
-        })();
-        if (diagnosticsEnabled) {
-          response.debug ??= [];
-          response.debug.push(
-            `[WorkerSyncDiag] http dbCloseMs=${dbCloseDurationMs ?? "unknown"}`
-          );
-          response.debug.push(
-            `[WorkerSyncDiag] http handleMs=${Date.now() - handleSyncStartedAt} requestTotalMs=${Date.now() - requestStartedAt} responseBytesApprox=${estimateJsonBytes(response)}`
-          );
-        }
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - handleSyncStartedAt,
-          "http.sync.handle"
-        );
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - requestStartedAt,
-          "http.sync.request.total"
-        );
-        debug.log(`[HTTP] Sync completed successfully`);
-        return jsonResponse(response, corsHeaders);
-      } catch (error) {
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - requestStartedAt,
-          "http.sync.request.failed"
-        );
-        console.error("[HTTP] Sync error:", error);
-        return errorResponse(formatDbError(error), corsHeaders);
-      }
+        requestStartedAt,
+      });
     }
 
     return new Response("Not Found", { status: 404, headers: corsHeaders });

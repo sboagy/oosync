@@ -54,7 +54,7 @@ export interface TableMetaCore {
   supportsIncremental: boolean;
   hasDeletedFlag: boolean;
   /** Optional relation kind for diagnostics; consumers may sync tables or views. */
-  relationKind?: "table" | "view" | "materialized_view" | string;
+  relationKind?: string;
 }
 
 export interface SyncSchemaDeps {
