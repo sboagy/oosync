@@ -1482,7 +1482,7 @@ function buildTableRegistryHelperLines(): string[] {
     "export const TABLE_REGISTRY_MERGED: Record<SyncableTableName, TableMeta> = Object.fromEntries(",
     "  Object.entries(TABLE_REGISTRY_CORE).map(([tableName, core]) => {",
     "    const extras = TABLE_EXTRAS[tableName as SyncableTableName];",
-    "    return [tableName, { ...(core as TableMetaCore), ...extras }];",
+    "    return [tableName, { ...core, ...extras }];",
     "  })",
     ") as Record<SyncableTableName, TableMeta>;",
     "",
@@ -1557,7 +1557,7 @@ function buildAppTableMetaAccessorLines(): string[] {
     "  | ((row: Readonly<Record<string, unknown>>) => Record<string, unknown>)",
     "  | undefined {",
     "  const normalize = TABLE_REGISTRY[tableName]?.normalize;",
-    "  return normalize ? (row) => normalize(row as Record<string, unknown>) : undefined;",
+    "  return normalize ? (row) => normalize(row) : undefined;",
     "}",
     "",
     "export function isRegisteredTable(tableName: string): boolean {",
@@ -1637,7 +1637,6 @@ function buildAppTableMetaTs(params: {
       "\n  type SyncableTableName as GeneratedSyncableTableName," +
       "\n  SYNCABLE_TABLES as SYNCABLE_TABLES_GENERATED," +
       "\n  TABLE_REGISTRY_CORE," +
-      "\n  type TableMetaCore," +
       `\n} from ${JSON.stringify(params.generatedTableMetaImportPath)};`,
     "",
     ...buildAppTableMetaInterfaceLines(),
