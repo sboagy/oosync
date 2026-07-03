@@ -8,6 +8,25 @@ import type {
 const WORKER_URL = import.meta.env.VITE_WORKER_URL || "http://localhost:8787";
 const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
 const DEFAULT_INITIAL_PAGE_COUNT = 16;
+const DIAGNOSTICS_STORAGE_KEY = "oosync:sync-diagnostics";
+const CONSUMER_DIAGNOSTICS_STORAGE_KEYS = [
+  "tunetrees:sync-baseline-diagnostics",
+];
+
+function parseDiagnosticsFlag(value: string | null): boolean | null {
+  if (value === null) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["", "1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
 
 function isRuntimeDiagnosticsEnabled(): boolean {
   if (SYNC_DIAGNOSTICS) {
@@ -20,7 +39,24 @@ function isRuntimeDiagnosticsEnabled(): boolean {
 
   try {
     const params = new URLSearchParams(window.location.search);
-    return params.get("ttSyncDiagnostics") === "1";
+    const queryFlag =
+      parseDiagnosticsFlag(params.get("ttSyncDiagnostics")) ??
+      parseDiagnosticsFlag(params.get("syncDiagnostics"));
+    if (queryFlag !== null) {
+      window.localStorage.setItem(DIAGNOSTICS_STORAGE_KEY, String(queryFlag));
+      return queryFlag;
+    }
+
+    const storedFlag = parseDiagnosticsFlag(
+      window.localStorage.getItem(DIAGNOSTICS_STORAGE_KEY)
+    );
+    if (storedFlag !== null) {
+      return storedFlag;
+    }
+
+    return CONSUMER_DIAGNOSTICS_STORAGE_KEYS.some(
+      (key) => parseDiagnosticsFlag(window.localStorage.getItem(key)) === true
+    );
   } catch {
     return false;
   }

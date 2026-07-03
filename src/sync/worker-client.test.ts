@@ -3,6 +3,16 @@ import { WorkerClient } from "./worker-client";
 
 const fetchMock = vi.fn();
 
+function createStorage(initial: Record<string, string> = {}) {
+  const values = new Map(Object.entries(initial));
+  return {
+    getItem: vi.fn((key: string) => values.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => {
+      values.set(key, value);
+    }),
+  };
+}
+
 beforeEach(() => {
   vi.unstubAllGlobals();
   fetchMock.mockReset();
@@ -45,6 +55,25 @@ describe("WorkerClient initial pull batching", () => {
       location: {
         search: "?ttSyncDiagnostics=1",
       },
+      localStorage: createStorage(),
+    });
+    const client = new WorkerClient("token");
+
+    await client.sync([]);
+
+    expect(getRequestPayload().diagnostics).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it("requests diagnostics when enabled by consumer localStorage", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.stubGlobal("window", {
+      location: {
+        search: "",
+      },
+      localStorage: createStorage({
+        "tunetrees:sync-baseline-diagnostics": "true",
+      }),
     });
     const client = new WorkerClient("token");
 
