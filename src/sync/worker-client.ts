@@ -63,6 +63,17 @@ function isRuntimeDiagnosticsEnabled(): boolean {
   }
 }
 
+function isSyncResponse(value: unknown): value is SyncResponse {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (
+    Array.isArray(candidate.changes) && typeof candidate.syncedAt === "string"
+  );
+}
+
 export class WorkerClient {
   private readonly authToken: string;
 
@@ -114,7 +125,10 @@ export class WorkerClient {
       throw new Error(`Sync failed: ${response.status} ${text}`);
     }
 
-    const json = await response.json();
+    const json: unknown = await response.json();
+    if (!isSyncResponse(json)) {
+      throw new Error("Sync failed: invalid worker response");
+    }
 
     if (diagnosticsEnabled) {
       const total = Array.isArray(json.changes) ? json.changes.length : 0;

@@ -59,10 +59,13 @@ describe("WorkerClient initial pull batching", () => {
     });
     const client = new WorkerClient("token");
 
-    await client.sync([]);
+    try {
+      await client.sync([]);
 
-    expect(getRequestPayload().diagnostics).toBe(true);
-    logSpy.mockRestore();
+      expect(getRequestPayload().diagnostics).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("requests diagnostics when enabled by consumer localStorage", async () => {
@@ -77,9 +80,12 @@ describe("WorkerClient initial pull batching", () => {
     });
     const client = new WorkerClient("token");
 
-    await client.sync([]);
+    try {
+      await client.sync([]);
 
-    expect(getRequestPayload().diagnostics).toBe(true);
-    logSpy.mockRestore();
+      expect(getRequestPayload().diagnostics).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });

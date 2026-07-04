@@ -34,6 +34,7 @@ import { createSyncSchema } from "./sync-schema";
 
 const CORE_COL_DELETED = "deleted";
 const CORE_COL_LAST_MODIFIED_AT = "last_modified_at";
+const RPC_UNBOUNDED_PAGE_LIMIT = 2_147_483_647;
 
 export interface WorkerArtifacts extends SyncSchemaDeps {
   schemaTables: SchemaTables;
@@ -868,6 +869,11 @@ function getPrimaryKeyColumns(
   });
 }
 
+function getPrimaryKeyOrderColumns(tableName: string): string[] {
+  const primaryKey = getPrimaryKey(tableName);
+  return Array.isArray(primaryKey) ? primaryKey : [primaryKey];
+}
+
 /**
  * Extract rowId string from a row object.
  */
@@ -904,7 +910,12 @@ function extractRowId(
 async function fetchViaRPC(
   tx: Transaction,
   functionName: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  options: {
+    orderByColumns?: readonly string[];
+    pageLimit?: number;
+    pageOffset?: number;
+  } = {}
 ): Promise<Record<string, unknown>[]> {
   try {
     // Build: SELECT * FROM function_name($1::TYPE, $2::TYPE, ...)
@@ -947,7 +958,16 @@ async function fetchViaRPC(
       placeholders.push(cast ? `$${paramNum}::${cast}` : `$${paramNum}`);
     }
 
-    const queryString = `SELECT * FROM ${functionName}(${placeholders.join(", ")})`;
+    const orderBy = (options.orderByColumns ?? [])
+      .map((column) => `"${column.replaceAll('"', '""')}"`)
+      .join(", ");
+    let queryString = `SELECT * FROM ${functionName}(${placeholders.join(", ")})${orderBy ? ` ORDER BY ${orderBy}` : ""}`;
+    if (options.pageLimit !== undefined || options.pageOffset !== undefined) {
+      paramValues.push(options.pageLimit ?? RPC_UNBOUNDED_PAGE_LIMIT);
+      queryString += ` LIMIT $${paramValues.length}::INTEGER`;
+      paramValues.push(options.pageOffset ?? 0);
+      queryString += ` OFFSET $${paramValues.length}::INTEGER`;
+    }
 
     // Execute using the underlying session (bypassing Drizzle's sql template to avoid array wrapping)
     // Access the postgres-js client through the transaction's internal session
@@ -1455,12 +1475,16 @@ async function fetchTableForInitialSyncPage(
       rule,
       ctx,
       lastSyncAt: null,
-      pageLimit: limit,
-      pageOffset: offset,
+      pageLimit: RPC_UNBOUNDED_PAGE_LIMIT,
+      pageOffset: 0,
     });
 
     const queryStartedAt = Date.now();
-    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams);
+    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams, {
+      orderByColumns: getPrimaryKeyOrderColumns(tableName),
+      pageLimit: limit,
+      pageOffset: offset,
+    });
     const queryDurationMs = Date.now() - queryStartedAt;
 
     debug.log(
@@ -1661,6 +1685,7 @@ async function processInitialSyncPaged(
       timings,
       timingAggregates,
     });
+    pagesCollected += 1;
     const { changes } = page;
 
     if (changes.length === 0) {
@@ -1674,7 +1699,6 @@ async function processInitialSyncPaged(
     const nextOffset = offset + changes.length;
     const isLastPageForTable = changes.length < pageSize;
     allChanges.push(...changes);
-    pagesCollected += 1;
 
     if (isLastPageForTable) {
       tableIndex += 1;
@@ -1770,11 +1794,15 @@ async function fetchChangedRowsFromTable(
       rule,
       ctx,
       lastSyncAt,
-      pageLimit: 1000,
+      pageLimit: RPC_UNBOUNDED_PAGE_LIMIT,
       pageOffset: 0,
     });
 
-    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams);
+    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams, {
+      orderByColumns: getPrimaryKeyOrderColumns(tableName),
+      pageLimit: 1000,
+      pageOffset: 0,
+    });
 
     debug.log(
       `[PULL:INCR] ${tableName} (RPC): fetched ${rows.length} changed rows via ${rule.functionName} since ${lastSyncAt}`
