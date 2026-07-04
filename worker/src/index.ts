@@ -34,6 +34,7 @@ import { createSyncSchema } from "./sync-schema";
 
 const CORE_COL_DELETED = "deleted";
 const CORE_COL_LAST_MODIFIED_AT = "last_modified_at";
+const RPC_UNBOUNDED_PAGE_LIMIT = 2_147_483_647;
 
 export interface WorkerArtifacts extends SyncSchemaDeps {
   schemaTables: SchemaTables;
@@ -48,7 +49,7 @@ function notInitialized(name: string): never {
 
 let schemaTables: SchemaTables | null = null;
 let SYNCABLE_TABLES: readonly string[] = [];
-let TABLE_REGISTRY: Record<string, unknown> = {};
+let TABLE_REGISTRY: Record<string, { relationKind?: string }> = {};
 
 let getPrimaryKey: (tableName: string) => string | string[] = () =>
   notInitialized("getPrimaryKey");
@@ -68,6 +69,7 @@ let loadUserCollections: (params: {
   tx: WorkerTransaction;
   userId: string;
   tables: SchemaTables;
+  collectionNames?: ReadonlySet<string>;
 }) => Promise<Record<string, Set<string>>> = async () =>
   notInitialized("loadUserCollections");
 let minimalPayload: (
@@ -152,6 +154,10 @@ function isPostgresJsErrorLike(error: unknown): error is PostgresJsErrorLike {
 
 function toOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function sortStrings(values: Iterable<string>): string[] {
+  return [...values].sort((a, b) => a.localeCompare(b));
 }
 
 function getErrorCause(error: unknown): unknown {
@@ -333,6 +339,8 @@ export interface Env {
   SYNC_DIAGNOSTICS?: string;
   /** Optional: only emit diagnostics when JWT sub matches this value. */
   SYNC_DIAGNOSTICS_USER_ID?: string;
+  /** Optional HMAC secret for signed initial-sync cursors. */
+  OOSYNC_CURSOR_SECRET?: string;
 }
 
 /** Context passed through sync operations */
@@ -348,6 +356,155 @@ interface SyncContext {
   diagnosticsEnabled: boolean;
   perfDebugEnabled: boolean;
   perfMinDurationMs: number;
+  cursorSecret?: string;
+  initialCursor?: DecodedInitialSyncCursor;
+}
+
+interface InitialPullPage {
+  changes: SyncChange[];
+  diagnostics: string[];
+  timing?: InitialPageTiming;
+}
+
+function getRelationKind(tableName: string): string {
+  return TABLE_REGISTRY[tableName]?.relationKind ?? "relation";
+}
+
+function estimatePayloadBytes(changes: SyncChange[]): number {
+  return estimateJsonBytes(changes);
+}
+
+function estimateJsonBytes(value: unknown): number {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).length;
+  } catch {
+    return -1;
+  }
+}
+
+interface InitialPageTiming {
+  tableName: string;
+  relationKind: string;
+  ruleKind: string;
+  offset: number;
+  limit: number;
+  rows: number;
+  queryDurationMs: number;
+  transformDurationMs: number;
+  totalDurationMs: number;
+  payloadBytes: number;
+}
+
+interface InitialTimingAggregate {
+  pages: number;
+  relations: Set<string>;
+  rows: number;
+  queryDurationMs: number;
+  transformDurationMs: number;
+  totalDurationMs: number;
+  payloadBytes: number;
+}
+
+function createInitialPageTiming(params: {
+  tableName: string;
+  ruleKind: string;
+  offset: number;
+  limit: number;
+  rows: number;
+  queryDurationMs: number;
+  transformDurationMs: number;
+  totalDurationMs: number;
+  payloadBytes: number;
+}): InitialPageTiming {
+  return {
+    ...params,
+    relationKind: getRelationKind(params.tableName),
+  };
+}
+
+function createInitialPageDiagnostics(timing: InitialPageTiming): string {
+  return [
+    "[WorkerSyncDiag]",
+    "initialPage",
+    `relation=${timing.tableName}`,
+    `kind=${timing.relationKind}`,
+    `rule=${timing.ruleKind}`,
+    `offset=${timing.offset}`,
+    `limit=${timing.limit}`,
+    `rows=${timing.rows}`,
+    `queryMs=${timing.queryDurationMs}`,
+    `transformMs=${timing.transformDurationMs}`,
+    `payloadBytes=${timing.payloadBytes}`,
+    `totalMs=${timing.totalDurationMs}`,
+  ].join(" ");
+}
+
+function addInitialTimingAggregate(
+  aggregates: Map<string, InitialTimingAggregate>,
+  timing: InitialPageTiming
+): void {
+  const aggregate = aggregates.get(timing.relationKind) ?? {
+    pages: 0,
+    relations: new Set<string>(),
+    rows: 0,
+    queryDurationMs: 0,
+    transformDurationMs: 0,
+    totalDurationMs: 0,
+    payloadBytes: 0,
+  };
+  aggregate.pages += 1;
+  aggregate.relations.add(timing.tableName);
+  aggregate.rows += timing.rows;
+  aggregate.queryDurationMs += timing.queryDurationMs;
+  aggregate.transformDurationMs += timing.transformDurationMs;
+  aggregate.totalDurationMs += timing.totalDurationMs;
+  aggregate.payloadBytes += timing.payloadBytes;
+  aggregates.set(timing.relationKind, aggregate);
+}
+
+function createInitialKindDiagnostics(
+  aggregates: Map<string, InitialTimingAggregate>
+): string[] {
+  return [...aggregates.entries()]
+    .sort(([kindA], [kindB]) => kindA.localeCompare(kindB))
+    .map(([kind, aggregate]) =>
+      [
+        "[WorkerSyncDiag]",
+        "initialKind",
+        `kind=${kind}`,
+        `pages=${aggregate.pages}`,
+        `relations=${aggregate.relations.size}`,
+        `rows=${aggregate.rows}`,
+        `queryMs=${aggregate.queryDurationMs}`,
+        `transformMs=${aggregate.transformDurationMs}`,
+        `payloadBytes=${aggregate.payloadBytes}`,
+        `totalMs=${aggregate.totalDurationMs}`,
+      ].join(" ")
+    );
+}
+
+function createInitialRelationTopDiagnostics(
+  timings: InitialPageTiming[]
+): string | undefined {
+  const top = [...timings]
+    .sort((a, b) => b.totalDurationMs - a.totalDurationMs)
+    .slice(0, 8)
+    .map((timing) =>
+      [
+        timing.tableName,
+        `kind=${timing.relationKind}`,
+        `totalMs=${timing.totalDurationMs}`,
+        `queryMs=${timing.queryDurationMs}`,
+        `rows=${timing.rows}`,
+        `payloadBytes=${timing.payloadBytes}`,
+      ].join(":")
+    )
+    .join(",");
+
+  if (!top) {
+    return undefined;
+  }
+  return `[WorkerSyncDiag] initialRelationTop sort=totalMs relations=${top}`;
 }
 
 interface InitialSyncCursorV1 {
@@ -357,24 +514,80 @@ interface InitialSyncCursorV1 {
   syncStartedAt: string;
 }
 
-function encodeCursor(cursor: InitialSyncCursorV1): string {
-  return btoa(JSON.stringify(cursor));
+interface InitialSyncCursorPayloadV2 {
+  v: 2;
+  userId: string;
+  tableIndex: number;
+  offset: number;
+  syncStartedAt: string;
+  collections: Record<string, string[]>;
 }
 
-function decodeCursor(raw: string): InitialSyncCursorV1 {
+interface InitialSyncCursorV2 extends InitialSyncCursorPayloadV2 {
+  sig: string;
+}
+
+interface DecodedInitialSyncCursor {
+  tableIndex: number;
+  offset: number;
+  syncStartedAt: string;
+  collections?: Record<string, Set<string>>;
+}
+
+interface InitialSyncPageState {
+  tableIndex: number;
+  offset: number;
+}
+
+interface InitialSyncPageBudget {
+  pageSize: number;
+  pageCount: number;
+}
+
+function decodeBase64Url(value: string): Uint8Array {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = normalized.padEnd(
+    normalized.length + ((4 - (normalized.length % 4)) % 4),
+    "="
+  );
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.codePointAt(i) ?? 0;
+  }
+  return out;
+}
+
+function encodeBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCodePoint(byte);
+  }
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+}
+
+function encodeJsonCursor(value: unknown): string {
+  return btoa(JSON.stringify(value));
+}
+
+function decodeJsonCursor(raw: string): unknown {
   let parsed: unknown;
   try {
     parsed = JSON.parse(atob(raw));
   } catch {
     throw new Error("Invalid pullCursor");
   }
+  return parsed;
+}
 
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error("Invalid pullCursor");
-  }
-
-  const obj = parsed as Record<string, unknown>;
-  if (obj.v !== 1) throw new Error("Unsupported pullCursor version");
+function validateCursorFields(obj: Record<string, unknown>): {
+  tableIndex: number;
+  offset: number;
+  syncStartedAt: string;
+} {
   const tableIndex = Number(obj.tableIndex);
   const offset = Number(obj.offset);
   const syncStartedAt = String(obj.syncStartedAt);
@@ -389,7 +602,208 @@ function decodeCursor(raw: string): InitialSyncCursorV1 {
     throw new Error("Invalid pullCursor.syncStartedAt");
   }
 
-  return { v: 1, tableIndex, offset, syncStartedAt };
+  return { tableIndex, offset, syncStartedAt };
+}
+
+function decodeCursorCollections(value: unknown): Record<string, Set<string>> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const out: Record<string, Set<string>> = {};
+  for (const [name, rawValues] of Object.entries(value)) {
+    if (!Array.isArray(rawValues)) {
+      continue;
+    }
+    out[name] = new Set(rawValues.map(String));
+  }
+  return out;
+}
+
+function encodeCursorCollections(
+  collections: Record<string, Set<string>>,
+  collectionNames: ReadonlySet<string>
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const name of [...collectionNames].sort((a, b) => a.localeCompare(b))) {
+    const collection = collections[name];
+    if (!collection) {
+      continue;
+    }
+    out[name] = [...collection].sort((a, b) => a.localeCompare(b));
+  }
+  return out;
+}
+
+async function signCursorPayload(
+  payload: InitialSyncCursorPayloadV2,
+  secret: string
+): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(JSON.stringify(payload))
+  );
+  return encodeBase64Url(new Uint8Array(signature));
+}
+
+async function verifyCursorSignature(
+  cursor: InitialSyncCursorV2,
+  secret: string
+): Promise<boolean> {
+  const { sig, ...payload } = cursor;
+  const expected = await signCursorPayload(payload, secret);
+  const actualBytes = decodeBase64Url(sig);
+  const expectedBytes = decodeBase64Url(expected);
+  if (actualBytes.length !== expectedBytes.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < actualBytes.length; i += 1) {
+    diff |= actualBytes[i] ^ expectedBytes[i];
+  }
+  return diff === 0;
+}
+
+async function encodeCursor(
+  cursor: DecodedInitialSyncCursor,
+  userId: string,
+  collections: Record<string, Set<string>>,
+  collectionNames: ReadonlySet<string>,
+  cursorSecret: string | undefined
+): Promise<string> {
+  if (!cursorSecret || collectionNames.size === 0) {
+    return encodeJsonCursor({
+      v: 1,
+      tableIndex: cursor.tableIndex,
+      offset: cursor.offset,
+      syncStartedAt: cursor.syncStartedAt,
+    } satisfies InitialSyncCursorV1);
+  }
+
+  const payload: InitialSyncCursorPayloadV2 = {
+    v: 2,
+    userId,
+    tableIndex: cursor.tableIndex,
+    offset: cursor.offset,
+    syncStartedAt: cursor.syncStartedAt,
+    collections: encodeCursorCollections(collections, collectionNames),
+  };
+  return encodeJsonCursor({
+    ...payload,
+    sig: await signCursorPayload(payload, cursorSecret),
+  } satisfies InitialSyncCursorV2);
+}
+
+async function decodeCursor(
+  raw: string,
+  userId: string,
+  cursorSecret: string | undefined
+): Promise<DecodedInitialSyncCursor> {
+  const parsed = decodeJsonCursor(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("Invalid pullCursor");
+  }
+  const obj = parsed as Record<string, unknown>;
+  const fields = validateCursorFields(obj);
+
+  if (obj.v === 1) {
+    return fields;
+  }
+
+  if (obj.v !== 2) {
+    throw new TypeError("Unsupported pullCursor version");
+  }
+  if (!cursorSecret) {
+    throw new Error("Signed pullCursor requires cursor secret");
+  }
+  if (typeof obj.sig !== "string") {
+    throw new TypeError("Invalid pullCursor signature");
+  }
+  const cursor = obj as unknown as InitialSyncCursorV2;
+  if (!(await verifyCursorSignature(cursor, cursorSecret))) {
+    throw new Error("Invalid pullCursor signature");
+  }
+  if (cursor.userId !== userId) {
+    throw new Error("Invalid pullCursor user");
+  }
+  return {
+    ...fields,
+    collections: decodeCursorCollections(obj.collections),
+  };
+}
+
+async function encodeNextInitialSyncCursor(
+  state: InitialSyncPageState,
+  syncStartedAt: string,
+  userId: string,
+  collections: Record<string, Set<string>>,
+  collectionNames: ReadonlySet<string>,
+  cursorSecret: string | undefined
+): Promise<string | undefined> {
+  if (state.tableIndex >= SYNCABLE_TABLES.length) {
+    return undefined;
+  }
+
+  return await encodeCursor(
+    {
+      tableIndex: state.tableIndex,
+      offset: state.offset,
+      syncStartedAt,
+    },
+    userId,
+    collections,
+    collectionNames,
+    cursorSecret
+  );
+}
+
+function normalizePositiveIntegerHint(
+  value: number | undefined,
+  defaultValue: number,
+  maxValue: number
+): number {
+  const requested =
+    typeof value === "number" && Number.isFinite(value)
+      ? Math.max(1, Math.floor(value))
+      : defaultValue;
+  return Math.min(requested, maxValue);
+}
+
+function getInitialSyncPageBudget(
+  pageSizeHint: number | undefined,
+  pageCountHint: number | undefined
+): InitialSyncPageBudget {
+  return {
+    pageSize: normalizePositiveIntegerHint(pageSizeHint, 500, 500),
+    pageCount: normalizePositiveIntegerHint(pageCountHint, 1, 32),
+  };
+}
+
+function getInitialSyncStartState(params: {
+  initialCursor?: DecodedInitialSyncCursor;
+  syncStartedAtHint?: string;
+  now: string;
+}): InitialSyncPageState & { syncStartedAt: string } {
+  if (!params.initialCursor) {
+    return {
+      tableIndex: 0,
+      offset: 0,
+      syncStartedAt: params.syncStartedAtHint ?? params.now,
+    };
+  }
+
+  return {
+    tableIndex: params.initialCursor.tableIndex,
+    offset: params.initialCursor.offset,
+    syncStartedAt: params.initialCursor.syncStartedAt,
+  };
 }
 
 type DrizzleColumn = AnyPgColumn;
@@ -455,6 +869,11 @@ function getPrimaryKeyColumns(
   });
 }
 
+function getPrimaryKeyOrderColumns(tableName: string): string[] {
+  const primaryKey = getPrimaryKey(tableName);
+  return Array.isArray(primaryKey) ? primaryKey : [primaryKey];
+}
+
 /**
  * Extract rowId string from a row object.
  */
@@ -491,7 +910,12 @@ function extractRowId(
 async function fetchViaRPC(
   tx: Transaction,
   functionName: string,
-  params: Record<string, unknown>
+  params: Record<string, unknown>,
+  options: {
+    orderByColumns?: readonly string[];
+    pageLimit?: number;
+    pageOffset?: number;
+  } = {}
 ): Promise<Record<string, unknown>[]> {
   try {
     // Build: SELECT * FROM function_name($1::TYPE, $2::TYPE, ...)
@@ -534,7 +958,17 @@ async function fetchViaRPC(
       placeholders.push(cast ? `$${paramNum}::${cast}` : `$${paramNum}`);
     }
 
-    const queryString = `SELECT * FROM ${functionName}(${placeholders.join(", ")})`;
+    const orderBy = (options.orderByColumns ?? [])
+      .map((column) => `"${column.replaceAll('"', '""')}"`)
+      .join(", ");
+    const orderByClause = orderBy ? ` ORDER BY ${orderBy}` : "";
+    let queryString = `SELECT * FROM ${functionName}(${placeholders.join(", ")})${orderByClause}`;
+    if (options.pageLimit !== undefined || options.pageOffset !== undefined) {
+      paramValues.push(options.pageLimit ?? RPC_UNBOUNDED_PAGE_LIMIT);
+      queryString += ` LIMIT $${paramValues.length}::INTEGER`;
+      paramValues.push(options.pageOffset ?? 0);
+      queryString += ` OFFSET $${paramValues.length}::INTEGER`;
+    }
 
     // Execute using the underlying session (bypassing Drizzle's sql template to avoid array wrapping)
     // Access the postgres-js client through the transaction's internal session
@@ -1025,13 +1459,14 @@ async function fetchTableForInitialSyncPage(
   syncStartedAt: string,
   offset: number,
   limit: number
-): Promise<SyncChange[]> {
+): Promise<InitialPullPage> {
+  const startedAt = Date.now();
   const table = getSchemaTables()[tableName];
-  if (!table) return [];
+  if (!table) return { changes: [], diagnostics: [] };
 
   const t = table;
   const meta = TABLE_REGISTRY[tableName];
-  if (!meta) return [];
+  if (!meta) return { changes: [], diagnostics: [] };
 
   // Check if table uses RPC for filtering
   const rule = getPullRule(tableName);
@@ -1041,16 +1476,23 @@ async function fetchTableForInitialSyncPage(
       rule,
       ctx,
       lastSyncAt: null,
+      pageLimit: RPC_UNBOUNDED_PAGE_LIMIT,
+      pageOffset: 0,
+    });
+
+    const queryStartedAt = Date.now();
+    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams, {
+      orderByColumns: getPrimaryKeyOrderColumns(tableName),
       pageLimit: limit,
       pageOffset: offset,
     });
-
-    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams);
+    const queryDurationMs = Date.now() - queryStartedAt;
 
     debug.log(
       `[PULL:INITIAL] ${tableName} (RPC): fetched ${rows.length} rows via ${rule.functionName}`
     );
 
+    const transformStartedAt = Date.now();
     const changes: SyncChange[] = [];
     for (const row of rows) {
       // Apply adapter transformation: Postgres (snake_case) -> Client (camelCase)
@@ -1058,7 +1500,24 @@ async function fetchTableForInitialSyncPage(
       const rowId = extractRowId(tableName, transformed, t);
       changes.push(rowToSyncChange(tableName, rowId, transformed));
     }
-    return changes;
+    const transformDurationMs = Date.now() - transformStartedAt;
+    const totalDurationMs = Date.now() - startedAt;
+    const timing = createInitialPageTiming({
+      tableName,
+      ruleKind: `rpc:${rule.functionName}`,
+      offset,
+      limit,
+      rows: changes.length,
+      queryDurationMs,
+      transformDurationMs,
+      totalDurationMs,
+      payloadBytes: estimatePayloadBytes(changes),
+    });
+    return {
+      changes,
+      diagnostics: [createInitialPageDiagnostics(timing)],
+      timing,
+    };
   }
 
   // Standard SQL-based fetch (non-RPC tables)
@@ -1072,7 +1531,22 @@ async function fetchTableForInitialSyncPage(
     debug.log(
       `[PULL:INITIAL] Skipping ${tableName} (no matching rows for user)`
     );
-    return [];
+    const timing = createInitialPageTiming({
+      tableName,
+      ruleKind: "skipped:no-filter-match",
+      offset,
+      limit,
+      rows: 0,
+      queryDurationMs: 0,
+      transformDurationMs: 0,
+      totalDurationMs: Date.now() - startedAt,
+      payloadBytes: 0,
+    });
+    return {
+      changes: [],
+      diagnostics: [createInitialPageDiagnostics(timing)],
+      timing,
+    };
   }
 
   const whereConditions: unknown[] = [...conditions];
@@ -1089,78 +1563,131 @@ async function fetchTableForInitialSyncPage(
     query = query.where(and(...whereConditions));
   }
 
+  const queryStartedAt = Date.now();
   const rows = await query.limit(limit).offset(offset);
+  const queryDurationMs = Date.now() - queryStartedAt;
 
   debug.log(
     `[PULL:INITIAL] ${tableName}: fetched page rows=${rows.length} offset=${offset} limit=${limit}`
   );
 
+  const transformStartedAt = Date.now();
   const changes: SyncChange[] = [];
   for (const row of rows) {
     const r = row;
     const rowId = extractRowId(tableName, r, t);
     changes.push(rowToSyncChange(tableName, rowId, r));
   }
-  return changes;
+  const transformDurationMs = Date.now() - transformStartedAt;
+  const totalDurationMs = Date.now() - startedAt;
+  const timing = createInitialPageTiming({
+    tableName,
+    ruleKind: rule?.kind ?? "default",
+    offset,
+    limit,
+    rows: changes.length,
+    queryDurationMs,
+    transformDurationMs,
+    totalDurationMs,
+    payloadBytes: estimatePayloadBytes(changes),
+  });
+  return {
+    changes,
+    diagnostics: [createInitialPageDiagnostics(timing)],
+    timing,
+  };
+}
+
+async function collectInitialSyncPage(params: {
+  tx: Transaction;
+  ctx: SyncContext;
+  tableName: string;
+  syncStartedAt: string;
+  offset: number;
+  pageSize: number;
+  diagnostics: string[];
+  timings: InitialPageTiming[];
+  timingAggregates: Map<string, InitialTimingAggregate>;
+}): Promise<InitialPullPage> {
+  const pageStartedAt = Date.now();
+  const page = await fetchTableForInitialSyncPage(
+    params.tx,
+    params.tableName,
+    params.ctx,
+    params.syncStartedAt,
+    params.offset,
+    params.pageSize
+  );
+  const { changes } = page;
+  const pageDurationMs = Date.now() - pageStartedAt;
+  perfLogDuration(
+    params.ctx.perfDebugEnabled,
+    params.ctx.perfMinDurationMs,
+    pageDurationMs,
+    `initial.page relation=${params.tableName} kind=${getRelationKind(params.tableName)} offset=${params.offset} limit=${params.pageSize} rows=${changes.length}`
+  );
+  if (!params.ctx.diagnosticsEnabled) {
+    return page;
+  }
+
+  params.diagnostics.push(...page.diagnostics);
+  if (page.timing) {
+    params.timings.push(page.timing);
+    addInitialTimingAggregate(params.timingAggregates, page.timing);
+  }
+  return page;
 }
 
 async function processInitialSyncPaged(
   tx: Transaction,
   ctx: SyncContext,
-  cursorRaw: string | undefined,
   syncStartedAtHint: string | undefined,
-  pageSizeHint: number | undefined
+  pageSizeHint: number | undefined,
+  pageCountHint: number | undefined
 ): Promise<{
   changes: SyncChange[];
   nextCursor?: string;
   syncStartedAt: string;
+  diagnostics: string[];
 }> {
-  const MAX_PAGE_SIZE = 500;
-  const DEFAULT_PAGE_SIZE = 500;
-  const requested =
-    typeof pageSizeHint === "number" && Number.isFinite(pageSizeHint)
-      ? Math.max(1, Math.floor(pageSizeHint))
-      : DEFAULT_PAGE_SIZE;
-  const pageSize = Math.min(requested, MAX_PAGE_SIZE);
+  const { pageSize, pageCount } = getInitialSyncPageBudget(
+    pageSizeHint,
+    pageCountHint
+  );
+  const startState = getInitialSyncStartState({
+    initialCursor: ctx.initialCursor,
+    syncStartedAtHint,
+    now: ctx.now,
+  });
+  let { tableIndex, offset } = startState;
+  const { syncStartedAt } = startState;
+  const allChanges: SyncChange[] = [];
+  const diagnostics: string[] = [];
+  const timings: InitialPageTiming[] = [];
+  const timingAggregates = new Map<string, InitialTimingAggregate>();
+  let pagesCollected = 0;
 
-  let tableIndex = 0;
-  let offset = 0;
-  let syncStartedAt = syncStartedAtHint;
-
-  if (cursorRaw) {
-    const cursor = decodeCursor(cursorRaw);
-    tableIndex = cursor.tableIndex;
-    offset = cursor.offset;
-    syncStartedAt = cursor.syncStartedAt;
-  }
-
-  if (!syncStartedAt) {
-    syncStartedAt = ctx.now;
-  }
-
-  // Advance until we find a table with rows to return, or we finish.
-  while (tableIndex < SYNCABLE_TABLES.length) {
+  // Advance until we fill the requested page budget or finish all tables.
+  while (tableIndex < SYNCABLE_TABLES.length && pagesCollected < pageCount) {
     const tableName = SYNCABLE_TABLES[tableIndex];
     if (ctx.pullTables && !ctx.pullTables.has(tableName)) {
       tableIndex += 1;
       offset = 0;
       continue;
     }
-    const pageStartedAt = Date.now();
-    const changes = await fetchTableForInitialSyncPage(
+    const page = await collectInitialSyncPage({
       tx,
-      tableName,
       ctx,
+      tableName,
       syncStartedAt,
       offset,
-      pageSize
-    );
-    perfLogDuration(
-      ctx.perfDebugEnabled,
-      ctx.perfMinDurationMs,
-      Date.now() - pageStartedAt,
-      `initial.page table=${tableName} offset=${offset} limit=${pageSize} rows=${changes.length}`
-    );
+      pageSize,
+      diagnostics,
+      timings,
+      timingAggregates,
+    });
+    pagesCollected += 1;
+    const { changes } = page;
 
     if (changes.length === 0) {
       // Either table is empty / skipped OR we've paged past the end.
@@ -1172,37 +1699,38 @@ async function processInitialSyncPaged(
 
     const nextOffset = offset + changes.length;
     const isLastPageForTable = changes.length < pageSize;
+    allChanges.push(...changes);
 
     if (isLastPageForTable) {
-      const nextTableIndex = tableIndex + 1;
-      if (nextTableIndex >= SYNCABLE_TABLES.length) {
-        return { changes, syncStartedAt };
-      }
-      return {
-        changes,
-        syncStartedAt,
-        nextCursor: encodeCursor({
-          v: 1,
-          tableIndex: nextTableIndex,
-          offset: 0,
-          syncStartedAt,
-        }),
-      };
+      tableIndex += 1;
+      offset = 0;
+      continue;
     }
 
-    return {
-      changes,
-      syncStartedAt,
-      nextCursor: encodeCursor({
-        v: 1,
-        tableIndex,
-        offset: nextOffset,
-        syncStartedAt,
-      }),
-    };
+    offset = nextOffset;
   }
 
-  return { changes: [], syncStartedAt };
+  if (ctx.diagnosticsEnabled) {
+    diagnostics.push(...createInitialKindDiagnostics(timingAggregates));
+    const topRelations = createInitialRelationTopDiagnostics(timings);
+    if (topRelations) {
+      diagnostics.push(topRelations);
+    }
+  }
+
+  return {
+    changes: allChanges,
+    syncStartedAt,
+    nextCursor: await encodeNextInitialSyncCursor(
+      { tableIndex, offset },
+      syncStartedAt,
+      ctx.authUserId,
+      ctx.collections,
+      getRequiredCollectionNames(ctx.pullTables),
+      ctx.cursorSecret
+    ),
+    diagnostics,
+  };
 }
 
 // ============================================================================
@@ -1267,11 +1795,15 @@ async function fetchChangedRowsFromTable(
       rule,
       ctx,
       lastSyncAt,
-      pageLimit: 1000,
+      pageLimit: RPC_UNBOUNDED_PAGE_LIMIT,
       pageOffset: 0,
     });
 
-    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams);
+    const rows = await fetchViaRPC(tx, rule.functionName, rpcParams, {
+      orderByColumns: getPrimaryKeyOrderColumns(tableName),
+      pageLimit: 1000,
+      pageOffset: 0,
+    });
 
     debug.log(
       `[PULL:INCR] ${tableName} (RPC): fetched ${rows.length} changed rows via ${rule.functionName} since ${lastSyncAt}`
@@ -1378,28 +1910,29 @@ interface SyncTransactionResult {
   responseChanges: SyncChange[];
   nextCursor?: string;
   syncStartedAt?: string;
+  diagnostics?: string[];
 }
 
-function getCursorSummary(payload: SyncRequest): string {
-  if (!payload.pullCursor) {
+function getCursorSummary(
+  cursor: DecodedInitialSyncCursor | undefined
+): string {
+  if (!cursor) {
     return "cursor=none";
   }
 
-  try {
-    const cursor = decodeCursor(payload.pullCursor);
-    return `tableIndex=${cursor.tableIndex} offset=${cursor.offset}`;
-  } catch {
-    return "cursor=invalid";
-  }
+  const collectionNames = Object.keys(cursor.collections ?? {});
+  const sortedCollectionNames = sortStrings(collectionNames);
+  return `tableIndex=${cursor.tableIndex} offset=${cursor.offset} cursorCollections=${sortedCollectionNames.join(",") || "(none)"}`;
 }
 
 function addStartDiagnostics(
   diag: string[],
   payload: SyncRequest,
-  syncType: SyncType
+  syncType: SyncType,
+  initialCursor: DecodedInitialSyncCursor | undefined
 ): void {
   diag.push(
-    `[WorkerSyncDiag] type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} ${getCursorSummary(payload)}`
+    `[WorkerSyncDiag] type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} initialPageCount=${payload.initialPageCount ?? "null"} ${getCursorSummary(initialCursor)}`
   );
 }
 
@@ -1419,7 +1952,7 @@ function addResponseDiagnostics(
     .map(([tableName, count]) => `${tableName}:${count}`)
     .join(",");
   diag.push(
-    `[WorkerSyncDiag] changesOut=${responseChanges.length} nextCursor=${nextCursor ? "yes" : "no"} syncStartedAt=${syncStartedAt ?? "null"} topTables=${top || "(none)"}`
+    `[WorkerSyncDiag] changesOut=${responseChanges.length} payloadBytes=${estimatePayloadBytes(responseChanges)} nextCursor=${nextCursor ? "yes" : "no"} syncStartedAt=${syncStartedAt ?? "null"} topRelations=${top || "(none)"}`
   );
 }
 
@@ -1458,6 +1991,82 @@ function buildPullTables(
   return pullTables ? new Set(pullTables.map(String)) : undefined;
 }
 
+function addRuleCollectionNames(
+  rule: PullTableRule | undefined,
+  collectionNames: Set<string>
+): void {
+  if (!rule) {
+    return;
+  }
+
+  if (rule.kind === "inCollection") {
+    collectionNames.add(rule.collection);
+    return;
+  }
+
+  if (rule.kind === "compound") {
+    for (const nestedRule of rule.rules) {
+      addRuleCollectionNames(nestedRule, collectionNames);
+    }
+    return;
+  }
+
+  if (rule.kind === "rpc") {
+    for (const binding of Object.values(rule.paramMap)) {
+      if (binding.source === "collection") {
+        collectionNames.add(binding.collection);
+      }
+    }
+  }
+}
+
+function getPullTableNames(pullTables: Set<string> | undefined): string[] {
+  if (!pullTables) {
+    return [...SYNCABLE_TABLES];
+  }
+  return SYNCABLE_TABLES.filter((tableName) => pullTables.has(tableName));
+}
+
+function getRequiredCollectionNames(
+  pullTables: Set<string> | undefined
+): Set<string> {
+  const collectionNames = new Set<string>();
+  for (const tableName of getPullTableNames(pullTables)) {
+    addRuleCollectionNames(getPullRule(tableName), collectionNames);
+  }
+  return collectionNames;
+}
+
+function cloneCollectionMap(
+  collections: Record<string, Set<string>> | undefined
+): Record<string, Set<string>> {
+  const out: Record<string, Set<string>> = {};
+  if (!collections) {
+    return out;
+  }
+  for (const [name, values] of Object.entries(collections)) {
+    out[name] = new Set(values);
+  }
+  return out;
+}
+
+function getMissingCollectionNames(
+  requiredCollectionNames: ReadonlySet<string>,
+  collections: Record<string, Set<string>>,
+  overrides: SyncRequest["collectionsOverride"]
+): Set<string> {
+  const missing = new Set<string>();
+  for (const name of requiredCollectionNames) {
+    if (overrides && Object.hasOwn(overrides, name)) {
+      continue;
+    }
+    if (!collections[name]) {
+      missing.add(name);
+    }
+  }
+  return missing;
+}
+
 function logPullTableMode(pullTables: Set<string> | undefined): void {
   if (pullTables) {
     debug.log(
@@ -1469,27 +2078,85 @@ function logPullTableMode(pullTables: Set<string> | undefined): void {
   debug.log("[Worker] 🚨 No pullTables override - syncing all tables");
 }
 
-async function loadCollectionsForSync(
-  tx: Transaction,
-  authUserId: string,
-  payload: SyncRequest,
-  perfDebugEnabled: boolean,
-  perfMinDurationMs: number
-): Promise<Record<string, Set<string>>> {
+async function loadCollectionsForSync(params: {
+  tx: Transaction;
+  authUserId: string;
+  payload: SyncRequest;
+  requiredCollectionNames: ReadonlySet<string>;
+  carriedCollections?: Record<string, Set<string>>;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  diag?: string[];
+}): Promise<Record<string, Set<string>>> {
   const collectionsStartedAt = Date.now();
-  const collections = await loadUserCollections({
-    tx,
-    userId: authUserId,
+  const collections = cloneCollectionMap(params.carriedCollections);
+  const missingCollectionNames = getMissingCollectionNames(
+    params.requiredCollectionNames,
+    collections,
+    params.payload.collectionsOverride
+  );
+  const loadedCollections = await loadUserCollections({
+    tx: params.tx,
+    userId: params.authUserId,
     tables: getSchemaTables(),
+    collectionNames: missingCollectionNames,
   });
+  Object.assign(collections, loadedCollections);
   perfLogDuration(
-    perfDebugEnabled,
-    perfMinDurationMs,
+    params.perfDebugEnabled,
+    params.perfMinDurationMs,
     Date.now() - collectionsStartedAt,
     "sync.collections"
   );
-  applyCollectionOverrides(collections, payload.collectionsOverride);
+  const requiredNames = sortStrings(params.requiredCollectionNames).join(",");
+  const carriedNames = sortStrings(
+    Object.keys(params.carriedCollections ?? {})
+  ).join(",");
+  const loadedNames = sortStrings(missingCollectionNames).join(",");
+  params.diag?.push(
+    `[WorkerSyncDiag] collections loadMs=${Date.now() - collectionsStartedAt} required=${requiredNames || "(none)"} carried=${carriedNames || "(none)"} loaded=${loadedNames || "(none)"}`
+  );
+  applyCollectionOverrides(collections, params.payload.collectionsOverride);
+  if (params.diag && params.payload.collectionsOverride) {
+    const overrideKeys = sortStrings(
+      Object.keys(params.payload.collectionsOverride)
+    ).join(",");
+    params.diag.push(
+      `[WorkerSyncDiag] collections overrideKeys=${overrideKeys || "(none)"}`
+    );
+  }
   return collections;
+}
+
+async function reloadCollectionsAfterPush(params: {
+  ctx: SyncContext;
+  tx: Transaction;
+  authUserId: string;
+  payload: SyncRequest;
+  diagnosticsEnabled: boolean;
+  diag: string[];
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  requiredCollectionNames: ReadonlySet<string>;
+}): Promise<void> {
+  if (params.payload.changes.length === 0) {
+    if (params.diagnosticsEnabled) {
+      params.diag.push(
+        "[WorkerSyncDiag] collections reuseAfterPush=yes reason=no-changes"
+      );
+    }
+    return;
+  }
+
+  params.ctx.collections = await loadCollectionsForSync({
+    tx: params.tx,
+    authUserId: params.authUserId,
+    payload: params.payload,
+    requiredCollectionNames: params.requiredCollectionNames,
+    perfDebugEnabled: params.perfDebugEnabled,
+    perfMinDurationMs: params.perfMinDurationMs,
+    diag: params.diagnosticsEnabled ? params.diag : undefined,
+  });
 }
 
 async function processPullForSync(
@@ -1519,20 +2186,21 @@ async function processPullForSync(
   const page = await processInitialSyncPaged(
     tx,
     ctx,
-    payload.pullCursor,
     payload.syncStartedAt,
-    payload.pageSize
+    payload.pageSize,
+    payload.initialPageCount
   );
   perfLogDuration(
     perfDebugEnabled,
     perfMinDurationMs,
     Date.now() - pullStartedAt,
-    `sync.pull.initial pageChanges=${page.changes.length} nextCursor=${page.nextCursor ? "yes" : "no"}`
+    `sync.pull.initial pageChanges=${page.changes.length} pageCount=${payload.initialPageCount ?? "default"} nextCursor=${page.nextCursor ? "yes" : "no"}`
   );
   return {
     responseChanges: page.changes,
     nextCursor: page.nextCursor,
     syncStartedAt: page.syncStartedAt,
+    diagnostics: page.diagnostics,
   };
 }
 
@@ -1541,6 +2209,8 @@ async function runSyncTransaction(params: {
   payload: SyncRequest;
   userId: string;
   now: string;
+  cursorSecret?: string;
+  initialCursor?: DecodedInitialSyncCursor;
   diagnosticsEnabled: boolean;
   perfDebugEnabled: boolean;
   perfMinDurationMs: number;
@@ -1549,14 +2219,18 @@ async function runSyncTransaction(params: {
 }): Promise<SyncTransactionResult> {
   const txStartedAt = Date.now();
   const authUserId = params.userId;
-  const collections = await loadCollectionsForSync(
-    params.tx,
-    authUserId,
-    params.payload,
-    params.perfDebugEnabled,
-    params.perfMinDurationMs
-  );
   const pullTables = buildPullTables(params.payload.pullTables);
+  const requiredCollectionNames = getRequiredCollectionNames(pullTables);
+  const collections = await loadCollectionsForSync({
+    tx: params.tx,
+    authUserId,
+    payload: params.payload,
+    requiredCollectionNames,
+    carriedCollections: params.initialCursor?.collections,
+    perfDebugEnabled: params.perfDebugEnabled,
+    perfMinDurationMs: params.perfMinDurationMs,
+    diag: params.diagnosticsEnabled ? params.diag : undefined,
+  });
   logPullTableMode(pullTables);
 
   const ctx: SyncContext = {
@@ -1569,6 +2243,8 @@ async function runSyncTransaction(params: {
     diagnosticsEnabled: params.diagnosticsEnabled,
     perfDebugEnabled: params.perfDebugEnabled,
     perfMinDurationMs: params.perfMinDurationMs,
+    cursorSecret: params.cursorSecret,
+    initialCursor: params.initialCursor,
   };
 
   const pushStartedAt = Date.now();
@@ -1582,13 +2258,17 @@ async function runSyncTransaction(params: {
 
   // Reload collections after push so the pull phase sees any collection/ownership
   // changes written during the push (e.g. newly created rows in collection-backed tables).
-  ctx.collections = await loadCollectionsForSync(
-    params.tx,
+  await reloadCollectionsAfterPush({
+    ctx,
+    tx: params.tx,
     authUserId,
-    params.payload,
-    params.perfDebugEnabled,
-    params.perfMinDurationMs
-  );
+    payload: params.payload,
+    diagnosticsEnabled: params.diagnosticsEnabled,
+    diag: params.diag,
+    perfDebugEnabled: params.perfDebugEnabled,
+    perfMinDurationMs: params.perfMinDurationMs,
+    requiredCollectionNames,
+  });
 
   const result = await processPullForSync(
     params.tx,
@@ -1599,6 +2279,9 @@ async function runSyncTransaction(params: {
   );
 
   if (params.diagnosticsEnabled) {
+    if (result.diagnostics) {
+      params.diag.push(...result.diagnostics);
+    }
     addResponseDiagnostics(
       params.diag,
       result.responseChanges,
@@ -1609,6 +2292,11 @@ async function runSyncTransaction(params: {
 
   // NO GARBAGE COLLECTION NEEDED!
   // sync_change_log now has at most ~20 rows (one per table)
+  if (params.diagnosticsEnabled) {
+    params.diag.push(
+      `[WorkerSyncDiag] transaction totalMs=${Date.now() - txStartedAt}`
+    );
+  }
   perfLogDuration(
     params.perfDebugEnabled,
     params.perfMinDurationMs,
@@ -1619,45 +2307,59 @@ async function runSyncTransaction(params: {
   return result;
 }
 
-async function handleSync(
-  db: ReturnType<typeof drizzle>,
-  payload: SyncRequest,
-  userId: string,
-  diagnosticsEnabled: boolean,
-  perfDebugEnabled: boolean,
-  perfMinDurationMs: number
-): Promise<SyncResponse> {
+async function handleSync(params: {
+  db: ReturnType<typeof drizzle>;
+  payload: SyncRequest;
+  userId: string;
+  cursorSecret?: string;
+  diagnosticsEnabled: boolean;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  initialDiagnostics?: string[];
+}): Promise<SyncResponse> {
   const now = new Date().toISOString();
-  const diag: string[] = [];
+  const diag: string[] = [...(params.initialDiagnostics ?? [])];
   let responseChanges: SyncChange[] = [];
   let nextCursor: string | undefined;
   let syncStartedAt: string | undefined;
-  const syncType = payload.lastSyncAt ? "INCREMENTAL" : "INITIAL";
+  const syncType = params.payload.lastSyncAt ? "INCREMENTAL" : "INITIAL";
   const syncStartedAtMs = Date.now();
+  const initialCursor =
+    !params.payload.lastSyncAt && params.payload.pullCursor
+      ? await decodeCursor(
+          params.payload.pullCursor,
+          params.userId,
+          params.cursorSecret
+        )
+      : undefined;
 
   perfLog(
-    perfDebugEnabled,
-    `sync.start type=${syncType} changesIn=${payload.changes.length} lastSyncAt=${payload.lastSyncAt ?? "null"} pageSize=${payload.pageSize ?? "null"} hasCursor=${payload.pullCursor ? "yes" : "no"}`
+    params.perfDebugEnabled,
+    `sync.start type=${syncType} changesIn=${params.payload.changes.length} lastSyncAt=${params.payload.lastSyncAt ?? "null"} pageSize=${params.payload.pageSize ?? "null"} initialPageCount=${params.payload.initialPageCount ?? "null"} hasCursor=${params.payload.pullCursor ? "yes" : "no"}`
   );
 
-  if (diagnosticsEnabled) {
-    addStartDiagnostics(diag, payload, syncType);
+  if (params.diagnosticsEnabled) {
+    addStartDiagnostics(diag, params.payload, syncType, initialCursor);
   }
 
-  debug.log(`[SYNC] === Starting ${syncType} sync for user ${userId} ===`);
   debug.log(
-    `[SYNC] Request: lastSyncAt=${payload.lastSyncAt ?? "null"}, changes=${payload.changes.length}`
+    `[SYNC] === Starting ${syncType} sync for user ${params.userId} ===`
+  );
+  debug.log(
+    `[SYNC] Request: lastSyncAt=${params.payload.lastSyncAt ?? "null"}, changes=${params.payload.changes.length}`
   );
 
-  await db.transaction(async (tx) => {
+  await params.db.transaction(async (tx) => {
     const result = await runSyncTransaction({
       tx,
-      payload,
-      userId,
+      payload: params.payload,
+      userId: params.userId,
       now,
-      diagnosticsEnabled,
-      perfDebugEnabled,
-      perfMinDurationMs,
+      cursorSecret: params.cursorSecret,
+      initialCursor,
+      diagnosticsEnabled: params.diagnosticsEnabled,
+      perfDebugEnabled: params.perfDebugEnabled,
+      perfMinDurationMs: params.perfMinDurationMs,
       syncType,
       diag,
     });
@@ -1671,18 +2373,21 @@ async function handleSync(
   );
 
   perfLogDuration(
-    perfDebugEnabled,
-    perfMinDurationMs,
+    params.perfDebugEnabled,
+    params.perfMinDurationMs,
     Date.now() - syncStartedAtMs,
     `sync.complete type=${syncType} changesOut=${responseChanges.length} total`
   );
+  if (params.diagnosticsEnabled) {
+    diag.push(`[WorkerSyncDiag] sync totalMs=${Date.now() - syncStartedAtMs}`);
+  }
 
   return {
     changes: responseChanges,
     syncedAt: now,
     nextCursor,
     syncStartedAt,
-    debug: diagnosticsEnabled ? diag : undefined,
+    debug: params.diagnosticsEnabled ? diag : undefined,
   };
 }
 
@@ -1709,8 +2414,8 @@ function getCorsHeaders(request: Request): Record<string, string> {
 
 function jsonResponse(
   data: unknown,
-  status = 200,
-  corsHeaders: Record<string, string>
+  corsHeaders: Record<string, string>,
+  status = 200
 ): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -1720,10 +2425,230 @@ function jsonResponse(
 
 function errorResponse(
   message: string,
-  status = 500,
-  corsHeaders: Record<string, string>
+  corsHeaders: Record<string, string>,
+  status = 500
 ): Response {
-  return jsonResponse({ error: message }, status, corsHeaders);
+  return jsonResponse({ error: message }, corsHeaders, status);
+}
+
+interface SyncPostRequestParams {
+  request: Request;
+  env: Env;
+  corsHeaders: Record<string, string>;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  requestStartedAt: number;
+}
+
+function isSyncDiagnosticsEnabled(
+  env: Env,
+  userId: string,
+  payload: SyncRequest
+): boolean {
+  return (
+    payload.diagnostics === true &&
+    env.SYNC_DIAGNOSTICS === "true" &&
+    (!env.SYNC_DIAGNOSTICS_USER_ID || env.SYNC_DIAGNOSTICS_USER_ID === userId)
+  );
+}
+
+function getCursorSecret(env: Env): string | undefined {
+  return env.OOSYNC_CURSOR_SECRET || env.SUPABASE_JWT_SECRET;
+}
+
+async function authorizeSyncRequest(
+  request: Request,
+  env: Env,
+  perfDebugEnabled: boolean,
+  perfMinDurationMs: number
+): Promise<{ userId: string | null; authDurationMs: number }> {
+  const authStartedAt = Date.now();
+  const userId = await verifyJwt(
+    request,
+    env.SUPABASE_JWT_SECRET,
+    env.SUPABASE_URL
+  );
+  const authDurationMs = Date.now() - authStartedAt;
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    authDurationMs,
+    `http.sync.auth authorized=${userId ? "yes" : "no"}`
+  );
+  return { userId, authDurationMs };
+}
+
+async function parseSyncPayload(
+  request: Request,
+  perfDebugEnabled: boolean,
+  perfMinDurationMs: number
+): Promise<{ payload: SyncRequest; payloadParseDurationMs: number }> {
+  const payloadStartedAt = Date.now();
+  const payload: SyncRequest = await request.json();
+  const payloadParseDurationMs = Date.now() - payloadStartedAt;
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    payloadParseDurationMs,
+    `http.sync.payload.parse changesIn=${payload.changes.length}`
+  );
+  return { payload, payloadParseDurationMs };
+}
+
+function appendHttpDiagnostics(
+  response: SyncResponse,
+  dbCloseDurationMs: number | undefined,
+  handleSyncStartedAt: number,
+  requestStartedAt: number
+): void {
+  response.debug ??= [];
+  response.debug.push(
+    `[WorkerSyncDiag] http dbCloseMs=${dbCloseDurationMs ?? "unknown"}`,
+    `[WorkerSyncDiag] http handleMs=${Date.now() - handleSyncStartedAt} requestTotalMs=${Date.now() - requestStartedAt} responseBytesApprox=${estimateJsonBytes(response)}`
+  );
+}
+
+async function runSyncWithDb(params: {
+  env: Env;
+  payload: SyncRequest;
+  userId: string;
+  diagnosticsEnabled: boolean;
+  perfDebugEnabled: boolean;
+  perfMinDurationMs: number;
+  requestDiagnostics: string[];
+}): Promise<{ response: SyncResponse; dbCloseDurationMs: number | undefined }> {
+  const {
+    env,
+    payload,
+    userId,
+    diagnosticsEnabled,
+    perfDebugEnabled,
+    perfMinDurationMs,
+    requestDiagnostics,
+  } = params;
+  debug.log(`[HTTP] Sync request parsed, calling handleSync`);
+  const createDbStartedAt = Date.now();
+  const { db, close } = createDb(env);
+  const dbCreateDurationMs = Date.now() - createDbStartedAt;
+  if (diagnosticsEnabled) {
+    requestDiagnostics.push(
+      `[WorkerSyncDiag] http dbCreateMs=${dbCreateDurationMs}`
+    );
+  }
+  perfLogDuration(
+    perfDebugEnabled,
+    perfMinDurationMs,
+    dbCreateDurationMs,
+    "http.sync.db.create"
+  );
+
+  let dbCloseDurationMs: number | undefined;
+  let response: SyncResponse;
+  try {
+    response = await handleSync({
+      db,
+      payload,
+      userId,
+      cursorSecret: getCursorSecret(env),
+      diagnosticsEnabled,
+      perfDebugEnabled,
+      perfMinDurationMs,
+      initialDiagnostics: requestDiagnostics,
+    });
+  } finally {
+    const closeStartedAt = Date.now();
+    await close();
+    dbCloseDurationMs = Date.now() - closeStartedAt;
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      dbCloseDurationMs,
+      "http.sync.db.close"
+    );
+  }
+  return { response, dbCloseDurationMs };
+}
+
+async function handleSyncPostRequest(
+  params: SyncPostRequestParams
+): Promise<Response> {
+  const {
+    request,
+    env,
+    corsHeaders,
+    perfDebugEnabled,
+    perfMinDurationMs,
+    requestStartedAt,
+  } = params;
+  debug.log(`[HTTP] POST /api/sync received`);
+  perfLog(perfDebugEnabled, "http.sync.request.received");
+
+  const { userId, authDurationMs } = await authorizeSyncRequest(
+    request,
+    env,
+    perfDebugEnabled,
+    perfMinDurationMs
+  );
+  if (!userId) {
+    debug.log(`[HTTP] Unauthorized - JWT verification failed`);
+    return errorResponse("Unauthorized", corsHeaders, 401);
+  }
+
+  const { payload, payloadParseDurationMs } = await parseSyncPayload(
+    request,
+    perfDebugEnabled,
+    perfMinDurationMs
+  );
+  const diagnosticsEnabled = isSyncDiagnosticsEnabled(env, userId, payload);
+  const requestDiagnostics = diagnosticsEnabled
+    ? [
+        `[WorkerSyncDiag] http authMs=${authDurationMs} payloadParseMs=${payloadParseDurationMs}`,
+      ]
+    : [];
+
+  try {
+    const handleSyncStartedAt = Date.now();
+    const { response, dbCloseDurationMs } = await runSyncWithDb({
+      env,
+      payload,
+      userId,
+      diagnosticsEnabled,
+      perfDebugEnabled,
+      perfMinDurationMs,
+      requestDiagnostics,
+    });
+    if (diagnosticsEnabled) {
+      appendHttpDiagnostics(
+        response,
+        dbCloseDurationMs,
+        handleSyncStartedAt,
+        requestStartedAt
+      );
+    }
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - handleSyncStartedAt,
+      "http.sync.handle"
+    );
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - requestStartedAt,
+      "http.sync.request.total"
+    );
+    debug.log(`[HTTP] Sync completed successfully`);
+    return jsonResponse(response, corsHeaders);
+  } catch (error) {
+    perfLogDuration(
+      perfDebugEnabled,
+      perfMinDurationMs,
+      Date.now() - requestStartedAt,
+      "http.sync.request.failed"
+    );
+    console.error("[HTTP] Sync error:", error);
+    return errorResponse(formatDbError(error), corsHeaders);
+  }
 }
 
 async function fetch(request: Request, env: Env): Promise<Response> {
@@ -1756,104 +2681,19 @@ async function fetch(request: Request, env: Env): Promise<Response> {
 
     // Sync endpoint
     if (request.method === "POST" && url.pathname === "/api/sync") {
-      debug.log(`[HTTP] POST /api/sync received`);
-      perfLog(perfDebugEnabled, "http.sync.request.received");
-
-      // Authenticate
-      const authStartedAt = Date.now();
-      const userId = await verifyJwt(
+      return await handleSyncPostRequest({
         request,
-        env.SUPABASE_JWT_SECRET,
-        env.SUPABASE_URL
-      );
-      perfLogDuration(
+        env,
+        corsHeaders,
         perfDebugEnabled,
         perfMinDurationMs,
-        Date.now() - authStartedAt,
-        `http.sync.auth authorized=${userId ? "yes" : "no"}`
-      );
-      if (!userId) {
-        debug.log(`[HTTP] Unauthorized - JWT verification failed`);
-        return errorResponse("Unauthorized", 401, corsHeaders);
-      }
-
-      const diagnosticsEnabled =
-        env.SYNC_DIAGNOSTICS === "true" &&
-        (!env.SYNC_DIAGNOSTICS_USER_ID ||
-          env.SYNC_DIAGNOSTICS_USER_ID === userId);
-
-      const payloadStartedAt = Date.now();
-      const payload: SyncRequest = await request.json();
-      perfLogDuration(
-        perfDebugEnabled,
-        perfMinDurationMs,
-        Date.now() - payloadStartedAt,
-        `http.sync.payload.parse changesIn=${payload.changes.length}`
-      );
-
-      // Connect to database
-      try {
-        debug.log(`[HTTP] Sync request parsed, calling handleSync`);
-        const createDbStartedAt = Date.now();
-        const { db, close } = createDb(env);
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - createDbStartedAt,
-          "http.sync.db.create"
-        );
-
-        const handleSyncStartedAt = Date.now();
-        const response = await (async () => {
-          try {
-            return await handleSync(
-              db,
-              payload,
-              userId,
-              diagnosticsEnabled,
-              perfDebugEnabled,
-              perfMinDurationMs
-            );
-          } finally {
-            const closeStartedAt = Date.now();
-            await close();
-            perfLogDuration(
-              perfDebugEnabled,
-              perfMinDurationMs,
-              Date.now() - closeStartedAt,
-              "http.sync.db.close"
-            );
-          }
-        })();
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - handleSyncStartedAt,
-          "http.sync.handle"
-        );
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - requestStartedAt,
-          "http.sync.request.total"
-        );
-        debug.log(`[HTTP] Sync completed successfully`);
-        return jsonResponse(response, 200, corsHeaders);
-      } catch (error) {
-        perfLogDuration(
-          perfDebugEnabled,
-          perfMinDurationMs,
-          Date.now() - requestStartedAt,
-          "http.sync.request.failed"
-        );
-        console.error("[HTTP] Sync error:", error);
-        return errorResponse(formatDbError(error), 500, corsHeaders);
-      }
+        requestStartedAt,
+      });
     }
 
     return new Response("Not Found", { status: 404, headers: corsHeaders });
   } catch (error) {
     console.error("[HTTP] Unhandled error:", error);
-    return errorResponse("Internal Server Error", 500, corsHeaders);
+    return errorResponse("Internal Server Error", corsHeaders);
   }
 }

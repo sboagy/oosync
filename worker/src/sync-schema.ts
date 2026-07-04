@@ -53,6 +53,8 @@ export interface TableMetaCore {
   booleanColumns: string[];
   supportsIncremental: boolean;
   hasDeletedFlag: boolean;
+  /** Optional relation kind for diagnostics; consumers may sync tables or views. */
+  relationKind?: string;
 }
 
 export interface SyncSchemaDeps {
@@ -187,12 +189,17 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     tx: WorkerTransaction;
     userId: string;
     tables: SchemaTables;
+    collectionNames?: ReadonlySet<string>;
   }): Promise<Record<string, Set<string>>> {
     const collections = getWorkerConfig().collections ?? {};
     const result: Record<string, Set<string>> = {};
 
     // Load configured per-user collections.
     for (const [name, cfg] of Object.entries(collections)) {
+      if (params.collectionNames && !params.collectionNames.has(name)) {
+        continue;
+      }
+
       const table = params.tables[cfg.table];
       if (!table) {
         result[name] = new Set();

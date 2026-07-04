@@ -7,12 +7,78 @@ import type {
 
 const WORKER_URL = import.meta.env.VITE_WORKER_URL || "http://localhost:8787";
 const SYNC_DIAGNOSTICS = import.meta.env.VITE_SYNC_DIAGNOSTICS === "true";
+const DEFAULT_INITIAL_PAGE_COUNT = 16;
+const DIAGNOSTICS_STORAGE_KEY = "oosync:sync-diagnostics";
+const CONSUMER_DIAGNOSTICS_STORAGE_KEYS = [
+  "tunetrees:sync-baseline-diagnostics",
+];
+
+function parseDiagnosticsFlag(value: string | null): boolean | null {
+  if (value === null) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["", "1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function isRuntimeDiagnosticsEnabled(): boolean {
+  if (SYNC_DIAGNOSTICS) {
+    return true;
+  }
+
+  if (globalThis.window === undefined) {
+    return false;
+  }
+
+  try {
+    const { localStorage, location } = globalThis.window;
+    const params = new URLSearchParams(location.search);
+    const queryFlag =
+      parseDiagnosticsFlag(params.get("ttSyncDiagnostics")) ??
+      parseDiagnosticsFlag(params.get("syncDiagnostics"));
+    if (queryFlag !== null) {
+      localStorage.setItem(DIAGNOSTICS_STORAGE_KEY, String(queryFlag));
+      return queryFlag;
+    }
+
+    const storedFlag = parseDiagnosticsFlag(
+      localStorage.getItem(DIAGNOSTICS_STORAGE_KEY)
+    );
+    if (storedFlag !== null) {
+      return storedFlag;
+    }
+
+    return CONSUMER_DIAGNOSTICS_STORAGE_KEYS.some(
+      (key) => parseDiagnosticsFlag(localStorage.getItem(key)) === true
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isSyncResponse(value: unknown): value is SyncResponse {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (
+    Array.isArray(candidate.changes) && typeof candidate.syncedAt === "string"
+  );
+}
 
 export class WorkerClient {
-  private token: string;
+  private readonly authToken: string;
 
   constructor(token: string) {
-    this.token = token;
+    this.authToken = token;
   }
 
   async sync(
@@ -22,10 +88,15 @@ export class WorkerClient {
       pullCursor?: string;
       syncStartedAt?: string;
       pageSize?: number;
+      initialPageCount?: number;
       overrides?: SyncRequestOverrides | null;
     }
   ): Promise<SyncResponse> {
     const overrides = options?.overrides ?? undefined;
+    const initialPageCount =
+      options?.initialPageCount ??
+      (lastSyncAt ? undefined : DEFAULT_INITIAL_PAGE_COUNT);
+    const diagnosticsEnabled = isRuntimeDiagnosticsEnabled();
     const payload: SyncRequest = {
       changes,
       lastSyncAt,
@@ -33,16 +104,18 @@ export class WorkerClient {
       pullCursor: options?.pullCursor,
       syncStartedAt: options?.syncStartedAt,
       pageSize: options?.pageSize,
+      initialPageCount,
       collectionsOverride: overrides?.collectionsOverride,
       rpcParamOverrides: overrides?.rpcParamOverrides,
       pullTables: overrides?.pullTables,
+      diagnostics: diagnosticsEnabled ? true : undefined,
     };
 
     const response = await fetch(`${WORKER_URL}/api/sync`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
+        Authorization: `Bearer ${this.authToken}`,
       },
       body: JSON.stringify(payload),
     });
@@ -52,13 +125,16 @@ export class WorkerClient {
       throw new Error(`Sync failed: ${response.status} ${text}`);
     }
 
-    const json = await response.json();
+    const json: unknown = await response.json();
+    if (!isSyncResponse(json)) {
+      throw new Error("Sync failed: invalid worker response");
+    }
 
-    if (SYNC_DIAGNOSTICS) {
+    if (diagnosticsEnabled) {
       const total = Array.isArray(json.changes) ? json.changes.length : 0;
       console.log(`[WorkerClientDiag] response totalChanges=${total}`);
       if (Array.isArray(json.debug) && json.debug.length > 0) {
-        for (const line of json.debug.slice(0, 50)) {
+        for (const line of json.debug.slice(0, 200)) {
           console.log(`[WorkerClientDiag] worker: ${String(line)}`);
         }
       }

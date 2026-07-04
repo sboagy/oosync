@@ -4,6 +4,7 @@ import * as path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { orderSyncableTablesByDependency } from "./codegen/table-order";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1481,7 +1482,7 @@ function buildTableRegistryHelperLines(): string[] {
     "export const TABLE_REGISTRY_MERGED: Record<SyncableTableName, TableMeta> = Object.fromEntries(",
     "  Object.entries(TABLE_REGISTRY_CORE).map(([tableName, core]) => {",
     "    const extras = TABLE_EXTRAS[tableName as SyncableTableName];",
-    "    return [tableName, { ...(core as TableMetaCore), ...extras }];",
+    "    return [tableName, { ...core, ...extras }];",
     "  })",
     ") as Record<SyncableTableName, TableMeta>;",
     "",
@@ -1556,7 +1557,7 @@ function buildAppTableMetaAccessorLines(): string[] {
     "  | ((row: Readonly<Record<string, unknown>>) => Record<string, unknown>)",
     "  | undefined {",
     "  const normalize = TABLE_REGISTRY[tableName]?.normalize;",
-    "  return normalize ? (row) => normalize(row as Record<string, unknown>) : undefined;",
+    "  return normalize ? (row) => normalize(row) : undefined;",
     "}",
     "",
     "export function isRegisteredTable(tableName: string): boolean {",
@@ -1636,7 +1637,6 @@ function buildAppTableMetaTs(params: {
       "\n  type SyncableTableName as GeneratedSyncableTableName," +
       "\n  SYNCABLE_TABLES as SYNCABLE_TABLES_GENERATED," +
       "\n  TABLE_REGISTRY_CORE," +
-      "\n  type TableMetaCore," +
       `\n} from ${JSON.stringify(params.generatedTableMetaImportPath)};`,
     "",
     ...buildAppTableMetaInterfaceLines(),
@@ -2415,8 +2415,8 @@ function buildSchemaTs(params: {
     "text",
     "uniqueIndex",
   ] as const;
-  const usedBuilders = ALL_SQLITE_BUILDERS.filter(
-    (b) => new RegExp(String.raw`\b${b}\(`).test(tableContent)
+  const usedBuilders = ALL_SQLITE_BUILDERS.filter((b) =>
+    new RegExp(String.raw`\b${b}\(`).test(tableContent)
   );
 
   return [
@@ -3026,17 +3026,6 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
     columnDescriptionsByTable[row.table_name][row.column_name] = row.comment;
   }
 
-  const nextTableMeta = buildTableMetaTs({
-    schema: args.schema,
-    columns,
-    primaryKeys,
-    uniqueConstraints,
-    strict: args.strict,
-    syncableTables,
-    tableRegistryCore,
-    columnDescriptionsByTable,
-  });
-
   const changeCategoryByTable: Record<string, ChangeCategory> = {
     ...(config.tableMeta?.changeCategoryByTable ??
       EMPTY_CHANGE_CATEGORY_BY_TABLE),
@@ -3071,9 +3060,24 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
     foreignKeys,
     overrides: config.tableMeta?.tableSyncOrderOverrides ?? EMPTY_NUMBER_RECORD,
   });
+  const orderedSyncableTables = orderSyncableTablesByDependency({
+    syncableTables,
+    tableSyncOrder,
+  });
+
+  const nextTableMeta = buildTableMetaTs({
+    schema: args.schema,
+    columns,
+    primaryKeys,
+    uniqueConstraints,
+    strict: args.strict,
+    syncableTables: orderedSyncableTables,
+    tableRegistryCore,
+    columnDescriptionsByTable,
+  });
 
   const tableToSchemaKey = buildTableToSchemaKeyMap({
-    tables: syncableTables,
+    tables: orderedSyncableTables,
     overrides:
       config.tableMeta?.tableToSchemaKeyOverrides ?? EMPTY_STRING_RECORD,
   });
@@ -3084,7 +3088,7 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
       fromFile: outputAppTableMetaFile,
       toFile: outputTableMetaFile,
     }),
-    syncableTables,
+    syncableTables: orderedSyncableTables,
     changeCategoryByTable,
     normalizeDatetimeByTable,
     tableSyncOrder,
@@ -3100,7 +3104,7 @@ async function main(): Promise<void> /* NOSONAR - codegen orchestration is inten
   });
 
   const defaultWorkerConfig = buildDefaultWorkerConfig({
-    syncableTables,
+    syncableTables: orderedSyncableTables,
     columnsByTable,
     foreignKeys,
     tableRegistryCore,
