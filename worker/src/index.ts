@@ -961,7 +961,8 @@ async function fetchViaRPC(
     const orderBy = (options.orderByColumns ?? [])
       .map((column) => `"${column.replaceAll('"', '""')}"`)
       .join(", ");
-    let queryString = `SELECT * FROM ${functionName}(${placeholders.join(", ")})${orderBy ? ` ORDER BY ${orderBy}` : ""}`;
+    const orderByClause = orderBy ? ` ORDER BY ${orderBy}` : "";
+    let queryString = `SELECT * FROM ${functionName}(${placeholders.join(", ")})${orderByClause}`;
     if (options.pageLimit !== undefined || options.pageOffset !== undefined) {
       paramValues.push(options.pageLimit ?? RPC_UNBOUNDED_PAGE_LIMIT);
       queryString += ` LIMIT $${paramValues.length}::INTEGER`;
