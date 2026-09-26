@@ -49,7 +49,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.5.12",
     "@cloudflare/workers-types": "^5.20260923.1",
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.6.2",
     "tsx": "^4.23.13",
     "typescript": "7.0.2",
     "vitest": "^4.1.11"
