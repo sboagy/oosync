@@ -42,7 +42,7 @@
   },
   "dependencies": {
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
-    "drizzle-orm": "^0.45.2",
+    "drizzle-orm": "^0.45.3",
     "jose": "^6.2.12",
     "postgres": "^3.4.9"
   },
