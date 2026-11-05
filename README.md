@@ -34,6 +34,23 @@ Common generated outputs:
 
 The default output locations are configurable via `oosync.codegen.config.json`.
 
+## Postgres driver compatibility
+
+The generator and Worker use Postgres.js 4.1 or later within major version 4.
+Cloudflare consumers need `nodejs_compat` and a compatibility date of at least
+`2024-09-23`. Preserve package export conditions when bundling so the Worker
+uses the driver's `workerd` entry point and Cloudflare socket transport.
+
+Run `npm run test:postgres` against local Postgres to check Drizzle transactions,
+savepoint recovery, RPC array parameters, timestamp/JSON serialization and
+rollback. It defaults to local Supabase on port 54322; override with
+`OOSYNC_TEST_DATABASE_URL` (loopback hosts only). The suite uses temporary tables
+and does not migrate or modify consumer data. Consumer integration tests still
+need to exercise authentication, sync policy and the deployed Worker runtime.
+
+See the [Postgres.js migration guide](https://github.com/porsager/postgres#upgrading-from-v3)
+and [Cloudflare Node.js compatibility requirements](https://developers.cloudflare.com/workers/runtime-apis/nodejs/).
+
 ## Running codegen
 
 From your project root:

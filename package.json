@@ -31,6 +31,7 @@
     "codegen:schema": "tsx src/codegen-schema.ts",
     "codegen:schema:check": "tsx src/codegen-schema.ts --check",
     "test": "vitest run src/sync/sync-core-no-table-hacks.test.ts src/runtime/sqlite-wasm-adapter.test.ts",
+    "test:postgres": "node --test worker/tests/postgres-compatibility.test.mjs",
     "lint": "biome lint src worker",
     "format": "biome format --write src worker",
     "format:check": "biome format src worker",
@@ -44,7 +45,7 @@
     "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
     "drizzle-orm": "^0.45.4",
     "jose": "^6.2.13",
-    "postgres": "^3.4.9"
+    "postgres": "^4.1.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.3",
