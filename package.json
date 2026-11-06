@@ -30,7 +30,7 @@
   "scripts": {
     "codegen:schema": "tsx src/codegen-schema.ts",
     "codegen:schema:check": "tsx src/codegen-schema.ts --check",
-    "test": "vitest run src/sync/sync-core-no-table-hacks.test.ts src/runtime/sqlite-wasm-adapter.test.ts",
+    "test": "vitest run src/sync/apply-remote-changes-race.test.ts src/sync/sync-core-no-table-hacks.test.ts src/runtime/sqlite-wasm-adapter.test.ts",
     "test:postgres": "node --test worker/tests/postgres-compatibility.test.mjs",
     "lint": "biome lint src worker",
     "format": "biome format --write src worker",

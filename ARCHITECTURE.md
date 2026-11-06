@@ -117,7 +117,7 @@ Runtime flow is how data moves after a user changes local state:
 2. Local triggers or queue logic append changes to the outbox.
 3. `SyncService` and `SyncEngine` package pending changes and request remote updates.
 4. The worker authenticates the request, applies push logic to Postgres, evaluates pull rules, and returns normalized changes.
-5. The sync runtime applies remote changes back into local SQLite while suppressing local-trigger feedback loops.
+5. The sync runtime applies remote changes back into local SQLite while suppressing local-trigger feedback loops. For rows with sync timestamps, updates and deletes compare modification times within the SQLite write so an older response cannot overwrite a newer local edit. Equal timestamps allow server normalization; tables without timestamps retain unconditional application.
 6. The consumer continues to read local SQLite; it does not switch to direct remote reads after sync.
 
 Default conflict handling is last-write-wins unless the consumer layers additional conflict behavior above the shared protocol.

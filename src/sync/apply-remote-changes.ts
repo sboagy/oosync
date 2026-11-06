@@ -1,5 +1,5 @@
 import type { SyncChange } from "@oosync/shared/protocol";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { AnySQLiteColumn, AnySQLiteTable } from "drizzle-orm/sqlite-core";
 import { getAdapter, type SyncableTableName } from "./adapters";
 import { toCamelCase } from "./casing";
@@ -120,6 +120,15 @@ export async function applyRemoteChangesToLocalDb(params: {
         continue;
       }
 
+      // Compare inside the write, not in a separate SELECT: local edits can
+      // arrive while a push/pull request is in flight. Normalize timestamps in
+      // SQLite because equivalent ISO values can use different offsets/separators.
+      // Tables without sync timestamps retain their existing behavior.
+      const lastModifiedColumn = table.lastModifiedAt;
+      const remoteIsCurrent = lastModifiedColumn
+        ? sql`coalesce(julianday(${lastModifiedColumn}) <= julianday(${change.lastModifiedAt}), 1)`
+        : undefined;
+
       try {
         if (change.deleted) {
           // Delete local
@@ -148,7 +157,7 @@ export async function applyRemoteChangesToLocalDb(params: {
             }
             await params.localDb
               .delete(table)
-              .where(and(...conditions))
+              .where(and(...conditions, remoteIsCurrent))
               .run();
           } else if (typeof pk === "string") {
             const columnKey = toCamelCase(pk);
@@ -164,7 +173,10 @@ export async function applyRemoteChangesToLocalDb(params: {
             if (!column) {
               continue;
             }
-            await params.localDb.delete(table).where(eq(column, value)).run();
+            await params.localDb
+              .delete(table)
+              .where(and(eq(column, value), remoteIsCurrent))
+              .run();
           }
         } else {
           // Upsert local
@@ -207,6 +219,7 @@ export async function applyRemoteChangesToLocalDb(params: {
                 .values(sanitizedData)
                 .onConflictDoUpdate({
                   target: conflictTarget,
+                  setWhere: remoteIsCurrent,
                   set: sanitizedData,
                 })
                 .run();
@@ -243,6 +256,7 @@ export async function applyRemoteChangesToLocalDb(params: {
                 .values(sanitizedData)
                 .onConflictDoUpdate({
                   target: compositeTarget,
+                  setWhere: remoteIsCurrent,
                   set:
                     compositeKeys.length === 1 && compositeKeys[0] === "id"
                       ? sanitizedData
@@ -260,6 +274,7 @@ export async function applyRemoteChangesToLocalDb(params: {
               .values(sanitizedData)
               .onConflictDoUpdate({
                 target: conflictTarget,
+                setWhere: remoteIsCurrent,
                 set: sanitizedData,
               })
               .run();
