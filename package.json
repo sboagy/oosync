@@ -42,7 +42,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p worker/tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@sqlite.org/sqlite-wasm": "^3.53.0-build1",
+    "@sqlite.org/sqlite-wasm": "^3.54.1-build1",
     "drizzle-orm": "^0.45.4",
     "jose": "^6.2.15",
     "postgres": "^4.1.0"
