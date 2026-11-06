@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   createSqliteWasmDatabase,
@@ -5,6 +6,60 @@ import {
 } from "./sqlite-wasm-adapter";
 
 describe("sqlite-wasm adapter", () => {
+  it("preserves a pre-upgrade database and its pending writes across reloads", async () => {
+    // Exported by @sqlite.org/sqlite-wasm@3.53.0-build1. Keep these bytes
+    // unchanged: generating them with the installed version would hide regressions.
+    // The fixture records the original SQL and engine version for reproducibility.
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL("./fixtures/sqlite-3.53.0.json", import.meta.url),
+        "utf8"
+      )
+    ) as { sqliteVersion: string; databaseBase64: string };
+    expect(fixture.sqliteVersion).toBe("3.53.0");
+    const sqlite3 = await initSqliteWasm();
+    const db = createSqliteWasmDatabase(
+      sqlite3,
+      new Uint8Array(Buffer.from(fixture.databaseBase64, "base64"))
+    );
+    let exported: Uint8Array;
+    try {
+      expect(db.exec("PRAGMA integrity_check")[0]?.values).toEqual([["ok"]]);
+      expect(db.exec("PRAGMA user_version")[0]?.values).toEqual([[7]]);
+      expect(db.exec("SELECT * FROM item")[0]?.values).toEqual([
+        ["existing", "saved before upgrade", new Uint8Array([0, 1, 254, 255])],
+      ]);
+      // Exceed the original allocation to exercise RESIZEABLE deserialization.
+      db.run("UPDATE item SET data = ? WHERE id = ?", [
+        new Uint8Array(65536).fill(42),
+        "existing",
+      ]);
+      db.run("BEGIN");
+      db.run("DELETE FROM pending");
+      db.run("ROLLBACK");
+      exported = db.export();
+    } finally {
+      db.close();
+    }
+    const restored = createSqliteWasmDatabase(sqlite3, exported);
+    try {
+      expect(restored.exec("PRAGMA integrity_check")[0]?.values).toEqual([
+        ["ok"],
+      ]);
+      expect(restored.exec("SELECT data FROM item")[0]?.values).toEqual([
+        [new Uint8Array(65536).fill(42)],
+      ]);
+      expect(
+        restored.exec("SELECT * FROM pending ORDER BY rowid")[0]?.values
+      ).toEqual([
+        ["existing", "insert"],
+        ["existing", "update"],
+      ]);
+    } finally {
+      restored.close();
+    }
+  });
+
   it("supports the Drizzle-compatible statement surface", async () => {
     const sqlite3 = await initSqliteWasm();
     const db = createSqliteWasmDatabase(sqlite3);
