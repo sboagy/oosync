@@ -183,6 +183,16 @@ Use overrides to express exceptions, not as the default modeling mechanism.
 - `src/sync/runtime-context.ts`
   - Injected runtime dependencies such as local schema, queue table, sqlite instance access, persistence hooks, and logging.
 
+### Browser database rebuild safety
+
+Before a database-version rebuild, schema-version clearing, or configured forced-reset URL, the browser runtime inspects the persisted database through an isolated, read-only SQLite snapshot. Any remaining `sync_push_queue` row blocks the operation regardless of status. Nonempty, unsupported, or unreadable persisted outbox backups also block it. Inspection failures fail closed. A blocked initialization leaves database bytes, version, backup, and sync watermark intact and throws `BrowserSqliteMigrationBlockedError` with a `reason` of `outbox`, `backup`, `local_data`, or `inspection_failed`.
+
+Every populated application table blocks by default, including tables present in the new `syncableTables` contract. New metadata and installed triggers do not prove that pre-existing rows reached the server. Promoting a previously local-only table to synced status is supported only after its rows are durably preserved and approved through the hook; membership in the new sync schema never authorizes discard. SQLite internals and runtime trigger-control metadata are excluded. Consumers may provide `hooks.canDiscardLocalTable({ rawDb, userId, tableName })`, returning exactly `true` only for reconstructible data or data already durably preserved. The hook receives the read-only snapshot; it cannot waive outbox or backup checks. No consumer table names are built into the guard. Wire this through consumer-owned hooks, not edits to generated wrappers.
+
+The guard detects risk; it does not synchronize an old schema, export local-only data, or replay incompatible writes. Recover using a compatible app to synchronize or preserve local work before retrying. Consumers should display the blocked error and must not respond by clearing storage. Normal startup without a migration remains available with pending writes. Explicit `clearDb()` is still a destructive consumer operation and is outside this guard.
+
+This is a persisted-snapshot check, not cross-tab locking or proof that every synced row exists remotely. It assumes the outbox contract correctly tracks local writes. Coordinate shutdown of old tabs/devices and persistence of in-memory changes before upgrading; concurrent writers remain a separate lifecycle concern.
+
 ### Worker Runtime
 
 - `worker/src/index.ts`
