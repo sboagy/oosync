@@ -66,12 +66,15 @@ export type BrowserSqliteMigrationBlockReason =
 
 /** A destructive upgrade was refused; the persisted database is untouched. */
 export class BrowserSqliteMigrationBlockedError extends Error {
-  constructor(public readonly reason: BrowserSqliteMigrationBlockReason) {
+  public readonly reason: BrowserSqliteMigrationBlockReason;
+
+  constructor(reason: BrowserSqliteMigrationBlockReason) {
     super(
       "Local database upgrade blocked. Synchronize or preserve local work " +
         "using a compatible app before retrying. Do not clear local storage."
     );
     this.name = "BrowserSqliteMigrationBlockedError";
+    this.reason = reason;
   }
 }
 
