@@ -90,9 +90,10 @@ export interface IBrowserSqliteHooks {
     context: { userId: string }
   ) => Promise<void> | void;
   /**
-   * Called on a read-only snapshot for each populated table outside the new
-   * sync schema. Return true only if that table's data is reconstructible or
-   * already preserved elsewhere. Omission, false, or failure blocks migration.
+   * Called on a read-only snapshot for every populated application table.
+   * New sync metadata does not prove that existing rows were synchronized.
+   * Return true only if that table's data is reconstructible or already
+   * preserved elsewhere. Omission, false, or failure blocks migration.
    * This cannot waive queued writes or an unreplayed outbox backup.
    */
   canDiscardLocalTable?: (context: {
@@ -1135,13 +1136,13 @@ export function createBrowserSqliteClient<
           throw new BrowserSqliteMigrationBlockedError("outbox");
         }
       }
-      const synced = new Set(config.syncSchema.syncableTables);
+      // New metadata cannot establish whether old rows were ever synchronized.
+      // Require consumer preservation approval even for newly syncable tables.
       for (const tableName of names) {
         if (
           tableName.startsWith("sqlite_") ||
           tableName === "sync_push_queue" ||
-          tableName === "sync_trigger_control" ||
-          synced.has(tableName)
+          tableName === "sync_trigger_control"
         )
           continue;
         const quoted = `"${tableName.replaceAll('"', '""')}"`;

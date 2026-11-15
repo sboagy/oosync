@@ -39,14 +39,23 @@ const clients: IBrowserSqliteClient<Record<string, unknown>>[] = [];
 function makeClient(
   options: {
     version?: number;
+    syncableTables?: string[];
     hook?: IBrowserSqliteHooks["canDiscardLocalTable"];
   } = {}
 ) {
   const client = createBrowserSqliteClient({
     schema: {},
     syncSchema: {
-      syncableTables: ["item"],
+      syncableTables: options.syncableTables ?? ["item"],
       tableRegistry: {
+        draft: {
+          primaryKey: "body",
+          uniqueKeys: ["body"],
+          timestamps: [],
+          booleanColumns: [],
+          supportsIncremental: false,
+          hasDeletedFlag: false,
+        },
         item: {
           primaryKey: "id",
           uniqueKeys: ["id"],
@@ -56,8 +65,8 @@ function makeClient(
           hasDeletedFlag: false,
         },
       },
-      tableSyncOrder: { item: 1 },
-      tableToSchemaKey: { item: "item" },
+      tableSyncOrder: { item: 1, draft: 2 },
+      tableToSchemaKey: { item: "item", draft: "draft" },
     },
     syncPushQueue: queue,
     databaseVersion: options.version ?? 2,
@@ -167,7 +176,9 @@ beforeEach(() => {
     vi
       .fn()
       .mockResolvedValue(
-        new Response("CREATE TABLE item (id TEXT PRIMARY KEY, value TEXT);")
+        new Response(
+          "CREATE TABLE item (id TEXT PRIMARY KEY, value TEXT); CREATE TABLE draft (body TEXT PRIMARY KEY);"
+        )
       )
   );
   initialized = vi.fn();
@@ -240,6 +251,51 @@ describe("pre-rebuild guard (real SQLite and IndexedDB requests)", () => {
     await expectPreserved();
   });
 
+  it("blocks promotion of populated local-only data into the new sync schema", async () => {
+    await seed(
+      "CREATE TABLE draft (body TEXT); INSERT INTO draft VALUES ('local only');"
+    );
+    const hook = vi.fn(
+      ({ tableName }: { tableName: string }) => tableName === "item"
+    );
+    await expect(
+      makeClient({ syncableTables: ["item", "draft"], hook }).initializeDb(user)
+    ).rejects.toMatchObject({ reason: "local_data" });
+    expect(hook).toHaveBeenCalledWith(
+      expect.objectContaining({ tableName: "draft" })
+    );
+    await expectPreserved();
+  });
+
+  it("requires approval even for a populated table already named in sync metadata", async () => {
+    await seed();
+    await expect(makeClient().initializeDb(user)).rejects.toMatchObject({
+      reason: "local_data",
+    });
+    await expectPreserved();
+  });
+
+  it("allows promoted rows only after durable preservation is explicitly confirmed", async () => {
+    await seed(
+      "CREATE TABLE draft (body TEXT); INSERT INTO draft VALUES ('local only');"
+    );
+    const preservedRows = [["local only"]]; // Represents a verified durable export.
+    const hook: NonNullable<IBrowserSqliteHooks["canDiscardLocalTable"]> = ({
+      tableName,
+      rawDb,
+    }) => {
+      if (tableName === "item") return true;
+      expect(tableName).toBe("draft");
+      expect(rawDb.exec("SELECT body FROM draft")[0]?.values).toEqual(
+        preservedRows
+      );
+      return true;
+    };
+    await expect(
+      makeClient({ syncableTables: ["item", "draft"], hook }).initializeDb(user)
+    ).resolves.toBeDefined();
+  });
+
   it("blocks a removed formerly synced table rather than losing its rows", async () => {
     await seed(
       "CREATE TABLE retired (value TEXT); INSERT INTO retired VALUES ('keep');"
@@ -300,7 +356,7 @@ describe("pre-rebuild guard (real SQLite and IndexedDB requests)", () => {
   });
 
   it("permits empty local tables and an empty backup", async () => {
-    await seed("CREATE TABLE draft (body TEXT)");
+    await seed("DELETE FROM item; CREATE TABLE draft (body TEXT)");
     await put(
       keys.backup,
       new TextEncoder().encode(JSON.stringify({ version: 1, items: [] }))
@@ -334,7 +390,9 @@ describe("pre-rebuild guard (real SQLite and IndexedDB requests)", () => {
 
   it("can retry safely after a failed initialization once the old database is synchronized", async () => {
     await seed("INSERT INTO sync_push_queue VALUES ('failed')");
-    const client = makeClient();
+    const client = makeClient({
+      hook: ({ tableName }) => tableName === "item",
+    });
     await expect(client.initializeDb(user)).rejects.toMatchObject({
       reason: "outbox",
     });
