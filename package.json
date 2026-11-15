@@ -30,7 +30,7 @@
   "scripts": {
     "codegen:schema": "tsx src/codegen-schema.ts",
     "codegen:schema:check": "tsx src/codegen-schema.ts --check",
-    "test": "vitest run src/sync/apply-remote-changes-race.test.ts src/sync/sync-core-no-table-hacks.test.ts src/runtime/sqlite-wasm-adapter.test.ts",
+    "test": "vitest run src/runtime/browser-sqlite-migration.test.ts src/sync/apply-remote-changes-race.test.ts src/sync/sync-core-no-table-hacks.test.ts src/runtime/sqlite-wasm-adapter.test.ts",
     "test:postgres": "node --test worker/tests/postgres-compatibility.test.mjs",
     "lint": "biome lint src worker",
     "format": "biome format --write src worker",
@@ -51,6 +51,7 @@
     "@biomejs/biome": "^2.6.6",
     "@cloudflare/workers-types": "^5.20261110.1",
     "@types/node": "^26.6.6",
+    "fake-indexeddb": "^6.2.8",
     "tsx": "^4.23.15",
     "typescript": "7.0.2",
     "vitest": "^5.1.0"

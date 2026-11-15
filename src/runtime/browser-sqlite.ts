@@ -58,6 +58,23 @@ export interface IBrowserSqliteHookContext {
   userId: string;
 }
 
+export type BrowserSqliteMigrationBlockReason =
+  | "outbox"
+  | "backup"
+  | "local_data"
+  | "inspection_failed";
+
+/** A destructive upgrade was refused; the persisted database is untouched. */
+export class BrowserSqliteMigrationBlockedError extends Error {
+  constructor(public readonly reason: BrowserSqliteMigrationBlockReason) {
+    super(
+      "Local database upgrade blocked. Synchronize or preserve local work " +
+        "using a compatible app before retrying. Do not clear local storage."
+    );
+    this.name = "BrowserSqliteMigrationBlockedError";
+  }
+}
+
 export interface IBrowserSqliteHooks {
   logger: ILogger;
   onExistingDatabaseLoaded?: (
@@ -72,6 +89,17 @@ export interface IBrowserSqliteHooks {
     db: BrowserSqliteDatabase,
     context: { userId: string }
   ) => Promise<void> | void;
+  /**
+   * Called on a read-only snapshot for each populated table outside the new
+   * sync schema. Return true only if that table's data is reconstructible or
+   * already preserved elsewhere. Omission, false, or failure blocks migration.
+   * This cannot waive queued writes or an unreplayed outbox backup.
+   */
+  canDiscardLocalTable?: (context: {
+    rawDb: SqliteRawDatabase;
+    userId: string;
+    tableName: string;
+  }) => Promise<boolean> | boolean;
   onDatabaseClosed?: () => void;
 }
 
@@ -1058,6 +1086,89 @@ export function createBrowserSqliteClient<
     );
   }
 
+  async function assertMigrationSafe(
+    sqlite3: SqliteWasmModule,
+    userId: string,
+    existingData: Uint8Array | null
+  ): Promise<void> {
+    let snapshot: SqliteRawDatabase | null = null;
+    try {
+      // Inspect backup bytes directly: the permissive public loader returns
+      // null for unknown versions, which must not authorize deleting them.
+      const backupBytes = await loadFromIndexedDB(
+        config.storage.indexedDbName,
+        config.storage.indexedDbStore,
+        getOutboxBackupKey(userId)
+      );
+      if (backupBytes) {
+        const backup: unknown = decodeJsonFromBytes(backupBytes);
+        if (
+          typeof backup !== "object" ||
+          backup === null ||
+          !("version" in backup) ||
+          backup.version !== 1 ||
+          !("items" in backup) ||
+          !Array.isArray(backup.items) ||
+          backup.items.length > 0
+        ) {
+          throw new BrowserSqliteMigrationBlockedError("backup");
+        }
+      }
+      if (!existingData) return;
+
+      // Never attach this old-schema snapshot to the new Drizzle client or run
+      // consumer initialization hooks against it. Inspection must be read-only.
+      snapshot = createSqliteWasmDatabase(sqlite3, existingData);
+      snapshot.run("PRAGMA query_only = ON");
+      const tables =
+        snapshot.exec(
+          "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        )[0]?.values ?? [];
+      const names = tables.map((row) => String(row[0]));
+      if (names.includes("sync_push_queue")) {
+        // Successful writes are removed by markOutboxCompleted. Any remaining
+        // row, including an unknown/legacy status, must prevent data loss.
+        if (
+          (snapshot.exec("SELECT 1 FROM sync_push_queue LIMIT 1")[0]?.values
+            .length ?? 0) > 0
+        ) {
+          throw new BrowserSqliteMigrationBlockedError("outbox");
+        }
+      }
+      const synced = new Set(config.syncSchema.syncableTables);
+      for (const tableName of names) {
+        if (
+          tableName.startsWith("sqlite_") ||
+          tableName === "sync_push_queue" ||
+          tableName === "sync_trigger_control" ||
+          synced.has(tableName)
+        )
+          continue;
+        const quoted = `"${tableName.replaceAll('"', '""')}"`;
+        if (
+          (snapshot.exec(`SELECT 1 FROM ${quoted} LIMIT 1`)[0]?.values.length ??
+            0) === 0
+        )
+          continue;
+        const safe = await config.hooks.canDiscardLocalTable?.({
+          rawDb: snapshot,
+          userId,
+          tableName,
+        });
+        if (safe !== true) {
+          throw new BrowserSqliteMigrationBlockedError("local_data");
+        }
+      }
+    } catch (error) {
+      if (error instanceof BrowserSqliteMigrationBlockedError) throw error;
+      // Do not include row contents, backup payloads or consumer exceptions in
+      // the diagnostic error. An unreadable snapshot is not an empty snapshot.
+      throw new BrowserSqliteMigrationBlockedError("inspection_failed");
+    } finally {
+      snapshot?.close();
+    }
+  }
+
   async function backupPendingOutboxBestEffort(
     userId: string,
     db: SqliteRawDatabase
@@ -1159,17 +1270,6 @@ export function createBrowserSqliteClient<
         });
         const forcedReset = isForcedReset({ forceResetQueryParams });
 
-        if (forcedReset) {
-          try {
-            await clearOutboxBackupForUser(userId);
-          } catch (error) {
-            logger.warn(
-              "Failed to clear outbox backup for forced reset",
-              error
-            );
-          }
-        }
-
         const dbKey = getDbKey(userId);
         const dbVersionKey = getDbVersionKey(userId);
         const existingData = await loadFromIndexedDB(
@@ -1184,6 +1284,25 @@ export function createBrowserSqliteClient<
         );
         ensureNotCleared();
         const storedVersionNum = decodeDatabaseVersion(storedVersion);
+
+        if (
+          migrationNeeded ||
+          (existingData && storedVersionNum !== config.databaseVersion)
+        ) {
+          await assertMigrationSafe(sqlite3, userId, existingData);
+          ensureNotCleared();
+        }
+
+        if (forcedReset) {
+          try {
+            await clearOutboxBackupForUser(userId);
+          } catch (error) {
+            logger.warn(
+              "Failed to clear outbox backup for forced reset",
+              error
+            );
+          }
+        }
 
         let phase: "loaded" | "created" = "created";
         if (existingData && storedVersionNum === config.databaseVersion) {
