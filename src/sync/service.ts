@@ -74,14 +74,51 @@ export interface SyncServiceConfig {
  * Uses SyncEngine for push/pull and RealtimeManager for live updates.
  */
 export class SyncService {
-  private db: SqliteDatabase;
-  private syncEngine: SyncEngine;
+  private readonly db: SqliteDatabase;
+  private readonly syncEngine: SyncEngine;
   private realtimeManager: RealtimeManager | null = null;
-  private config: SyncServiceConfig;
+  private readonly config: SyncServiceConfig;
   private isSyncing = false;
-  private syncIntervalId: number | null = null; // For syncUp interval
-  private syncDownIntervalId: number | null = null; // For syncDown interval
+  private syncIntervalId: ReturnType<typeof globalThis.setInterval> | null =
+    null; // For syncUp interval
+  private syncDownIntervalId: ReturnType<typeof globalThis.setInterval> | null =
+    null; // For syncDown interval
   private consecutiveSyncUpFailures = 0;
+  private destroyed = false;
+  private destroyPromise: Promise<void> | null = null;
+  private autoSyncController: AbortController | null = null;
+  private readonly pendingWork = new Set<Promise<void>>();
+  private realtimeStart: Promise<void> | null = null;
+
+  private assertAlive(): void {
+    if (this.destroyed) throw new Error("Sync service has been destroyed");
+  }
+
+  // Track DB work from entry through persistence, including periodic outbox
+  // probes which run outside the mutually exclusive sync methods.
+  private beginWork(): () => void {
+    this.assertAlive();
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    this.pendingWork.add(pending);
+    return () => {
+      this.pendingWork.delete(pending);
+      finish();
+    };
+  }
+
+  private beginSync(): () => void {
+    this.assertAlive();
+    if (this.isSyncing) throw new SyncInProgressError();
+    const finish = this.beginWork();
+    this.isSyncing = true;
+    return () => {
+      this.isSyncing = false;
+      finish();
+    };
+  }
 
   constructor(db: SqliteDatabase, config: SyncServiceConfig) {
     this.db = db;
@@ -131,6 +168,7 @@ export class SyncService {
    * Useful for manual refresh from UI (e.g. DB menu command).
    */
   public async forceFullSyncDown(): Promise<SyncResult> {
+    this.assertAlive();
     // Clear incremental timestamp so syncDown treats this as cold start.
     this.syncEngine.clearLastSyncTimestamp();
     return await this.syncDown();
@@ -158,7 +196,13 @@ export class SyncService {
     // Pass 'this' (SyncService) instead of syncEngine so Realtime can use
     // the protected syncDown() that blocks when pending changes exist
     this.realtimeManager = new RealtimeManager(this, realtimeConfig);
-    void this.realtimeManager.start();
+    this.startRealtimeManager(this.realtimeManager);
+  }
+
+  private startRealtimeManager(manager: RealtimeManager): void {
+    this.realtimeStart = manager.start().finally(() => {
+      this.realtimeStart = null;
+    });
   }
 
   /**
@@ -193,6 +237,7 @@ export class SyncService {
    * @returns Sync result statistics
    */
   public async sync(): Promise<SyncResult> {
+    this.assertAlive();
     if (this.isSyncing) {
       throw new SyncInProgressError();
     }
@@ -201,7 +246,7 @@ export class SyncService {
       return await this.syncDown();
     }
 
-    this.isSyncing = true;
+    const finish = this.beginSync();
 
     try {
       // Use SyncEngine's bidirectional sync
@@ -218,7 +263,7 @@ export class SyncService {
       this.config.onSyncComplete?.(errorResult);
       throw error; // Re-throw to maintain error propagation
     } finally {
-      this.isSyncing = false;
+      finish();
     }
   }
 
@@ -228,6 +273,7 @@ export class SyncService {
   public async syncUp(options?: {
     allowDeletes?: boolean;
   }): Promise<SyncResult> {
+    this.assertAlive();
     if (this.isSyncing) {
       throw new SyncInProgressError();
     }
@@ -240,7 +286,7 @@ export class SyncService {
       return errorResult;
     }
 
-    this.isSyncing = true;
+    const finish = this.beginSync();
 
     try {
       const result = await this.syncEngine.syncUpFromOutbox(options);
@@ -270,7 +316,7 @@ export class SyncService {
       this.config.onSyncComplete?.(errorResult);
       throw error; // Re-throw to maintain error propagation
     } finally {
-      this.isSyncing = false;
+      finish();
     }
   }
 
@@ -282,11 +328,12 @@ export class SyncService {
    * the user gets the latest remote data.
    */
   public async syncDown(): Promise<SyncResult> {
+    this.assertAlive();
     if (this.isSyncing) {
       throw new SyncInProgressError();
     }
 
-    this.isSyncing = true;
+    const finish = this.beginSync();
 
     try {
       const pullOnly = this.config.pullOnly === true;
@@ -351,7 +398,7 @@ export class SyncService {
       this.config.onSyncComplete?.(errorResult);
       throw error; // Re-throw to maintain error propagation
     } finally {
-      this.isSyncing = false;
+      finish();
     }
   }
 
@@ -360,11 +407,12 @@ export class SyncService {
    * Still uploads pending local changes first to avoid zombie resurrect.
    */
   public async syncDownTables(tables: SyncableTable[]): Promise<SyncResult> {
+    this.assertAlive();
     if (this.isSyncing) {
       throw new SyncInProgressError();
     }
 
-    this.isSyncing = true;
+    const finish = this.beginSync();
     try {
       if (!this.config.pullOnly) {
         const stats = await this.syncEngine.getOutboxStats();
@@ -413,8 +461,84 @@ export class SyncService {
       this.config.onSyncComplete?.(errorResult);
       throw error; // Re-throw to maintain error propagation
     } finally {
-      this.isSyncing = false;
+      finish();
     }
+  }
+
+  private reportPeriodicUploadResult(result: SyncResult): void {
+    // Only show error toast for non-network failures
+    const hasNetworkError = result.errors.some(
+      (e) =>
+        e.includes("Failed to fetch") ||
+        e.includes("ERR_INTERNET_DISCONNECTED") ||
+        e.includes("NetworkError") ||
+        e.includes("Timed out while waiting for an open slot in the pool") ||
+        e.includes("Sync failed: 503")
+    );
+
+    if (result.success) {
+      this.consecutiveSyncUpFailures = 0;
+    } else {
+      this.consecutiveSyncUpFailures += 1;
+    }
+
+    // `itemsFailed` reflects local apply failures for pulled changes.
+    // Push failures often surface only in `errors`, so toast on those too.
+    if (!result.success && !hasNetworkError) {
+      const shouldToast =
+        this.consecutiveSyncUpFailures === 1 ||
+        this.consecutiveSyncUpFailures === 5 ||
+        this.consecutiveSyncUpFailures === 10;
+
+      if (shouldToast) {
+        const summary = result.errors[0] ?? "Unknown server error";
+        this.notifyError(
+          `Sync upload failed (attempt ${this.consecutiveSyncUpFailures}). Your data is still saved locally. ${summary}`,
+          7000
+        );
+      }
+    }
+  }
+
+  // A busy sync does not consume a startup attempt; other failures do.
+  private async handleInitialSyncError(
+    error: unknown,
+    attempt: number,
+    maxAttempts: number,
+    waitForRetry: (ms: number) => Promise<void>
+  ): Promise<boolean> {
+    if (error instanceof SyncInProgressError) {
+      // Expected when other sync activity is running; retry shortly without toasting.
+      console.log(
+        `[SyncDiag] initialSyncDown:busy attempt=${attempt} syncing=${this.isSyncing}`
+      );
+      await waitForRetry(250);
+      return true;
+    }
+
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.log(
+      `[SyncDiag] initialSyncDown:error attempt=${attempt}/${maxAttempts} message=${errorMsg}`
+    );
+
+    const delayMs = 500 * attempt;
+    const isLastAttempt = attempt === maxAttempts;
+
+    if (!isLastAttempt) {
+      console.warn(
+        `[SyncService] Initial syncDown failed (attempt ${attempt}/${maxAttempts}); retrying in ${delayMs}ms:`,
+        error
+      );
+      await waitForRetry(delayMs);
+      return false;
+    }
+
+    console.error("[SyncService] Initial syncDown failed:", error);
+    this.notifyError(
+      "Failed to sync data from server on startup. You may be seeing outdated data.",
+      8000
+    );
+    return false;
   }
 
   /**
@@ -427,10 +551,26 @@ export class SyncService {
    * Cost when idle: 1 Postgres query of sync_outbox every 2 minutes
    */
   public startAutoSync(): void {
-    if (this.syncIntervalId || this.syncDownIntervalId) {
+    this.assertAlive();
+    if (this.autoSyncController) {
       console.warn("[SyncService] Auto sync already running");
       return;
     }
+
+    const controller = new AbortController();
+    this.autoSyncController = controller;
+    const { signal } = controller;
+    const waitForRetry = (ms: number) =>
+      new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", done);
+          resolve();
+        };
+        const timer = setTimeout(done, ms);
+        signal.addEventListener("abort", done, { once: true });
+        if (signal.aborted) done();
+      });
 
     // Sync intervals - cheap due to outbox-driven architecture:
     // - syncUp only makes network call if local outbox has pending items
@@ -449,16 +589,17 @@ export class SyncService {
     // Deferring avoids unexpected outbox mutation during offline reload flows.
     let initialSyncDownInFlight = false;
     let initialSyncDownCompleted = false;
+    let waitingForOnline = false;
 
     const startPeriodicSyncTimers = () => {
-      if (periodicTimersStarted) return;
+      if (signal.aborted || periodicTimersStarted) return;
       periodicTimersStarted = true;
 
       // Periodic syncUp (frequent - push local changes to server)
       // Only runs if there are pending changes to avoid unnecessary network calls
       if (!this.config.pullOnly) {
-        this.syncIntervalId = window.setInterval(async () => {
-          if (periodicSyncUpTickInFlight) {
+        this.syncIntervalId = globalThis.setInterval(async () => {
+          if (signal.aborted || periodicSyncUpTickInFlight) {
             return;
           }
 
@@ -467,6 +608,7 @@ export class SyncService {
           }
 
           periodicSyncUpTickInFlight = true;
+          const finish = this.beginWork();
           try {
             // Safety check: ensure database is initialized
             if (!this.db) {
@@ -478,6 +620,7 @@ export class SyncService {
 
             // Check if there are pending changes before syncing (using outbox)
             const stats = await this.syncEngine.getOutboxStats();
+            if (signal.aborted) return;
             const hasPendingChanges = stats.pending > 0 || stats.inProgress > 0;
 
             if (hasPendingChanges) {
@@ -491,40 +634,7 @@ export class SyncService {
                 `[SyncService] Running periodic syncUp (${stats.pending} pending changes)...`
               );
               const result = await this.syncUp();
-              // Only show error toast for non-network failures
-              const hasNetworkError = result.errors.some(
-                (e) =>
-                  e.includes("Failed to fetch") ||
-                  e.includes("ERR_INTERNET_DISCONNECTED") ||
-                  e.includes("NetworkError") ||
-                  e.includes(
-                    "Timed out while waiting for an open slot in the pool"
-                  ) ||
-                  e.includes("Sync failed: 503")
-              );
-
-              if (result.success) {
-                this.consecutiveSyncUpFailures = 0;
-              } else {
-                this.consecutiveSyncUpFailures += 1;
-              }
-
-              // `itemsFailed` reflects local apply failures for pulled changes.
-              // Push failures often surface only in `errors`, so toast on those too.
-              if (!result.success && !hasNetworkError) {
-                const shouldToast =
-                  this.consecutiveSyncUpFailures === 1 ||
-                  this.consecutiveSyncUpFailures === 5 ||
-                  this.consecutiveSyncUpFailures === 10;
-
-                if (shouldToast) {
-                  const summary = result.errors[0] ?? "Unknown server error";
-                  this.notifyError(
-                    `Sync upload failed (attempt ${this.consecutiveSyncUpFailures}). Your data is still saved locally. ${summary}`,
-                    7000
-                  );
-                }
-              }
+              this.reportPeriodicUploadResult(result);
             } else {
               // Silent - no need to log when there's nothing to sync
             }
@@ -544,13 +654,14 @@ export class SyncService {
             );
           } finally {
             periodicSyncUpTickInFlight = false;
+            finish();
           }
         }, syncUpIntervalMs);
       }
 
       // Periodic syncDown (infrequent - pull remote changes from server)
-      this.syncDownIntervalId = window.setInterval(() => {
-        if (periodicSyncDownTickInFlight) {
+      this.syncDownIntervalId = globalThis.setInterval(() => {
+        if (signal.aborted || periodicSyncDownTickInFlight) {
           return;
         }
 
@@ -617,9 +728,11 @@ export class SyncService {
     };
 
     const runInitialSyncDown = () => {
-      if (initialSyncDownInFlight || initialSyncDownCompleted) return;
+      if (signal.aborted || initialSyncDownInFlight || initialSyncDownCompleted)
+        return;
       if (!navigator.onLine) return;
 
+      waitingForOnline = false;
       initialSyncDownInFlight = true;
       console.log(
         `[SyncDiag] initialSyncDown:start inFlight=${initialSyncDownInFlight} completed=${initialSyncDownCompleted} syncing=${this.isSyncing}`
@@ -627,12 +740,15 @@ export class SyncService {
       void (async () => {
         const maxAttempts = 3;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          if (signal.aborted) return;
           if (!navigator.onLine) {
             console.log(
               "[SyncService] Went offline during initial syncDown; deferring until online"
             );
-            window.addEventListener("online", runInitialSyncDown, {
+            waitingForOnline = true;
+            globalThis.addEventListener("online", runInitialSyncDown, {
               once: true,
+              signal,
             });
             return;
           }
@@ -655,43 +771,27 @@ export class SyncService {
             );
             return;
           } catch (error) {
-            if (error instanceof SyncInProgressError) {
-              // Expected when other sync activity is running; retry shortly without toasting.
-              console.log(
-                `[SyncDiag] initialSyncDown:busy attempt=${attempt} syncing=${this.isSyncing}`
-              );
-              await new Promise((r) => setTimeout(r, 250));
-              attempt -= 1;
-              continue;
-            }
-
-            const errorMsg =
-              error instanceof Error ? error.message : String(error);
-            console.log(
-              `[SyncDiag] initialSyncDown:error attempt=${attempt}/${maxAttempts} message=${errorMsg}`
+            if (signal.aborted) return;
+            const busy = await this.handleInitialSyncError(
+              error,
+              attempt,
+              maxAttempts,
+              waitForRetry
             );
-
-            const delayMs = 500 * attempt;
-            const isLastAttempt = attempt === maxAttempts;
-
-            if (!isLastAttempt) {
-              console.warn(
-                `[SyncService] Initial syncDown failed (attempt ${attempt}/${maxAttempts}); retrying in ${delayMs}ms:`,
-                error
-              );
-              await new Promise((r) => setTimeout(r, delayMs));
-              continue;
-            }
-
-            console.error("[SyncService] Initial syncDown failed:", error);
-            this.notifyError(
-              "Failed to sync data from server on startup. You may be seeing outdated data.",
-              8000
-            );
+            if (busy) attempt -= 1;
           }
         }
       })().finally(() => {
         initialSyncDownInFlight = false;
+        // Exhausted attempts must not prevent an explicit startup retry.
+        // An older run must never clear a replacement run's controller.
+        if (
+          !periodicTimersStarted &&
+          !waitingForOnline &&
+          this.autoSyncController === controller
+        ) {
+          this.autoSyncController = null;
+        }
         console.log(
           `[SyncDiag] initialSyncDown:finally inFlight=${initialSyncDownInFlight} completed=${initialSyncDownCompleted} syncing=${this.isSyncing}`
         );
@@ -704,7 +804,10 @@ export class SyncService {
       console.log(
         "[SyncService] Offline on startup - deferring initial syncDown until online"
       );
-      window.addEventListener("online", runInitialSyncDown, { once: true });
+      globalThis.addEventListener("online", runInitialSyncDown, {
+        once: true,
+        signal,
+      });
     }
   }
 
@@ -712,6 +815,8 @@ export class SyncService {
    * Stop automatic background sync
    */
   public stopAutoSync(): void {
+    this.autoSyncController?.abort();
+    this.autoSyncController = null;
     if (this.syncIntervalId) {
       clearInterval(this.syncIntervalId);
       this.syncIntervalId = null;
@@ -727,17 +832,25 @@ export class SyncService {
    * Start Realtime subscriptions
    */
   public async startRealtime(): Promise<void> {
+    this.assertAlive();
     if (!this.realtimeManager) {
       this.initializeRealtime();
+    } else if (
+      !this.realtimeStart &&
+      this.realtimeManager.getStatus() !== "connected"
+    ) {
+      this.startRealtimeManager(this.realtimeManager);
     }
-    await this.realtimeManager?.start();
+    await this.realtimeStart;
   }
 
   /**
    * Stop Realtime subscriptions
    */
   public async stopRealtime(): Promise<void> {
+    await this.realtimeStart;
     await this.realtimeManager?.stop();
+    this.realtimeStart = null;
   }
 
   /**
@@ -748,11 +861,31 @@ export class SyncService {
   }
 
   /**
-   * Cleanup resources
+   * Permanently stop this service and drain DB work before the consumer closes
+   * SQLite. In-flight requests finish normally (including persistence); they
+   * are not abandoned halfway through applying a response. Idempotent.
+   * Consumer-owned asynchronous completion callbacks need their own lifetime guard.
    */
-  public async destroy(): Promise<void> {
+  public destroy(): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
+    this.destroyed = true;
     this.stopAutoSync();
-    await this.stopRealtime();
+    this.destroyPromise = (async () => {
+      // Wait for both even if subscription teardown fails. No new DB work can
+      // enter after destroyed is set, so this snapshot is complete.
+      const results = await Promise.allSettled([
+        this.stopRealtime(),
+        ...this.pendingWork,
+      ]);
+      for (const result of results) {
+        if (result.status === "rejected") throw result.reason;
+      }
+    })().catch((error: unknown) => {
+      // Remain terminal, but permit retrying failed subscription cleanup.
+      this.destroyPromise = null;
+      throw error;
+    });
+    return this.destroyPromise;
   }
 }
 

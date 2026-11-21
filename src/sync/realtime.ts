@@ -53,11 +53,12 @@ export interface RealtimeState {
  * Manages Supabase Realtime subscriptions for live sync
  */
 export class RealtimeManager {
-  private syncService: SyncService;
+  private readonly syncService: SyncService;
   private config: RealtimeConfig;
-  private state: RealtimeState;
+  private readonly state: RealtimeState;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private supabase: SupabaseClient;
+  private readonly supabase: SupabaseClient;
+  private stopped = true;
 
   constructor(syncService: SyncService, config: RealtimeConfig) {
     this.syncService = syncService;
@@ -88,6 +89,7 @@ export class RealtimeManager {
     console.log(
       `[Realtime] Starting Realtime subscriptions for user ${this.config.userId}`
     );
+    this.stopped = false;
     this.state.status = "connecting";
 
     try {
@@ -112,6 +114,11 @@ export class RealtimeManager {
    * Stop all Realtime subscriptions
    */
   async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.debounceTimer !== null) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
     realtimeLog("[Realtime Stopping all subscriptions");
 
     for (const [tableName, channel] of this.state.channels.entries()) {
@@ -181,6 +188,7 @@ export class RealtimeManager {
     tableName: string,
     payload: RealtimePostgresChangesPayload<Record<string, unknown>>
   ): void {
+    if (this.stopped) return;
     const { eventType } = payload;
 
     console.log(`[Realtime] Signal received: ${eventType} on ${tableName}`);
@@ -200,6 +208,7 @@ export class RealtimeManager {
    * Trigger the global sync via SyncService
    */
   private async triggerSync(): Promise<void> {
+    if (this.stopped) return;
     if (this.syncService.syncing) {
       console.log(
         "[Realtime] Sync already in progress, skipping signal trigger"

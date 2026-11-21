@@ -183,6 +183,21 @@ Use overrides to express exceptions, not as the default modeling mechanism.
 - `src/sync/runtime-context.ts`
   - Injected runtime dependencies such as local schema, queue table, sqlite instance access, persistence hooks, and logging.
 
+### Sync shutdown
+
+`SyncService.stopAutoSync()` pauses scheduling and cancels startup retry waits
+and deferred online listeners; it can be restarted. It does not drain requests
+already running. `await service.destroy()` is the permanent, idempotent shutdown
+boundary: new sync/start calls are rejected, Realtime subscriptions and debounce
+callbacks stop, and active service DB operations (including periodic outbox
+probes and persistence) drain before it resolves. Consumers must await it before
+closing or replacing SQLite. Requests already running finish normally rather
+than being abandoned during apply/persistence. Consumer-owned async completion
+callbacks still require consumer lifetime guards. Failed subscription teardown
+can be retried by calling `destroy()` again; the service remains closed to new
+sync work during that retry. No schema or worker protocol
+change is involved.
+
 ### Browser database rebuild safety
 
 Before a database-version rebuild, schema-version clearing, or configured forced-reset URL, the browser runtime inspects the persisted database through an isolated, read-only SQLite snapshot. Any remaining `sync_push_queue` row blocks the operation regardless of status. Nonempty, unsupported, or unreadable persisted outbox backups also block it. Inspection failures fail closed. A blocked initialization leaves database bytes, version, backup, and sync watermark intact and throws `BrowserSqliteMigrationBlockedError` with a `reason` of `outbox`, `backup`, `local_data`, or `inspection_failed`.
