@@ -2,6 +2,20 @@
 
 Schema-agnostic sync tooling for Postgres ↔ SQLite (WASM) style workflows.
 
+## Development
+
+Use Node.js 26 for development and CI. The root `.nvmrc` is the shared version
+source; with nvm, run `nvm use` to select it. Install dependencies and run the
+same checks used by CI:
+
+```sh
+npm ci
+npm run lint
+npm run check
+npm run typecheck
+npm run test:unit
+```
+
 ## Design goals
 
 - **Schema-agnostic:** nothing in `oosync/` should hard-code application tables/columns.
