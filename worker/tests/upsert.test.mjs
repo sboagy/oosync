@@ -180,7 +180,7 @@ test("primary-key fallback rejects a different natural key without changing the 
       tx.transaction((sp) =>
         upsert(sp, { id: 1, owner: "b", event: null, value: "attack" })
       ),
-      /Upsert returned no row: table=upsert_probe; conflictTarget=\(id\); primaryKeyFallback=true; naturalKeyGuard=\(owner,event\)/
+      /Upsert returned no row: table=upsert_probe; conflictTarget=\(id\); primaryKeyFallback=true; protectedKeyGuard=\(owner,event\)/
     );
     assert.deepEqual(await tx.select().from(table), [
       { id: 1, owner: "a", event: null, value: "original" },
@@ -846,7 +846,7 @@ for (const [before, afterValue] of [
       await upsert(tx, original);
       await assert.rejects(
         upsert(tx, { ...original, event: afterValue, value: "changed" }),
-        /Natural-key changes for an existing identity are not supported/
+        /Protected natural-key changes or identity reassignment are not supported/
       );
       assert.deepEqual(await tx.select().from(table), [original]);
     });
@@ -902,7 +902,7 @@ test("rejects a changed natural key that would update a different existing ident
     await tx.insert(table).values(originals);
     await assert.rejects(
       upsert(tx, { ...originals[0], event: "second", value: "changed" }),
-      /Natural-key changes for an existing identity are not supported/
+      /Protected natural-key changes or identity reassignment are not supported/
     );
     assert.deepEqual(
       await tx.select().from(table).orderBy(table.id),
@@ -926,9 +926,85 @@ for (const event of [null, "first"]) {
       );
       await assert.rejects(
         upsert(tx, { ...original, value: "updated" }),
-        /Natural-key changes for an existing identity are not supported/
+        /Protected natural-key changes or identity reassignment are not supported/
       );
       assert.deepEqual(await tx.select().from(table), [original]);
     });
+  });
+}
+
+for (const [before, event] of [
+  [null, "filled"],
+  ["first", "second"],
+  ["first", null],
+]) {
+  test(`explicit mutable key permits ${before} -> ${event}`, async () => {
+    await fixture(async (tx) => {
+      const original = { id: 1, owner: "a", event: before, value: "original" };
+      await upsert(tx, original);
+      const changed = { ...original, event, value: "edited" };
+      const editable = { ...options, mutableNaturalKeyProps: ["event"] };
+      await applyUpsert(tx, table, natural, primary, changed, editable);
+      await applyUpsert(tx, table, natural, primary, changed, editable);
+      assert.deepEqual(await tx.select().from(table), [changed]);
+    });
+  });
+}
+
+test("editable keys retain owner protection and reject collisions with another identity", async () => {
+  await fixture(async (tx) => {
+    const originals = [
+      { id: 1, owner: "a", event: "first", value: "original" },
+      { id: 2, owner: "a", event: "second", value: "other" },
+    ];
+    await tx.insert(table).values(originals);
+    const editable = { ...options, mutableNaturalKeyProps: ["event"] };
+    await assert.rejects(
+      applyUpsert(
+        tx,
+        table,
+        natural,
+        primary,
+        { ...originals[0], owner: "b", event: "third" },
+        editable
+      ),
+      /Protected natural-key changes/
+    );
+    await assert.rejects(
+      applyUpsert(
+        tx,
+        table,
+        natural,
+        primary,
+        { ...originals[0], event: "second" },
+        editable
+      ),
+      /Protected natural-key changes/
+    );
+    assert.deepEqual(
+      await tx.select().from(table).orderBy(table.id),
+      originals
+    );
+  });
+});
+
+for (const [prop, policy] of [
+  ["id", {}],
+  ["unknown", {}],
+  ["owner", options],
+  ["owner", { protectedProps: ["owner"] }],
+]) {
+  test(`invalid editable key ${prop} with policy ${JSON.stringify(policy)} fails before SQL`, async () => {
+    await assert.rejects(
+      applyUpsert(
+        null,
+        table,
+        natural,
+        primary,
+        { id: 1 },
+        { ...policy, mutableNaturalKeyProps: [prop] }
+      ),
+      /Invalid mutable natural-key property/
+    );
   });
 }

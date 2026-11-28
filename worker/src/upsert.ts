@@ -3,9 +3,10 @@
  * after PostgreSQL reports a verified primary-key violation. This makes nullable
  * natural-key uploads repeatable without guessing how defaults or UNIQUE NULLS
  * NOT DISTINCT behave. A savepoint rolls back the failed first attempt.
- * Natural-key components are immutable through sync, including NULL-to-value edits.
+ * Consumers may explicitly allow mutable natural-key properties; all other key
+ * components remain protected, including ownership boundaries.
  *
- * The fallback atomically checks every natural-key component against `excluded`
+ * The fallback atomically checks protected natural-key components against `excluded`
  * (including defaults and BEFORE INSERT effects) before updating. Updated key
  * properties use those same normalized values. All uploads require explicit
  * primary keys, retain configured insert-only fields, and reject skipped writes.
@@ -23,19 +24,47 @@ import type {
 
 type KeyColumn = { col: AnyPgColumn; prop: string };
 
+interface UpsertOptions {
+  /**
+   * Properties to omit from the UPDATE set (still inserted on first write).
+   * This is critical when upserting on a non-PK unique key.
+   */
+  omitSetProps?: readonly string[];
+  /** Editable natural-key properties, excluding identity/ownership fields. */
+  mutableNaturalKeyProps?: readonly string[];
+  /** Auth-bound and declarative access-scope properties cannot be editable keys. */
+  protectedProps?: readonly string[];
+}
+
+export function validateMutableNaturalKeys(
+  table: DynamicPgTable,
+  conflictKeyCols: KeyColumn[],
+  primaryKeyCols: KeyColumn[],
+  opts?: UpsertOptions
+): void {
+  const omit = opts?.omitSetProps ?? [];
+  const mutable = opts?.mutableNaturalKeyProps ?? [];
+  for (const prop of mutable) {
+    if (
+      !conflictKeyCols.some((key) => key.prop === prop) ||
+      primaryKeyCols.some((key) => key.prop === prop) ||
+      omit.includes(prop) ||
+      opts?.protectedProps?.includes(prop)
+    ) {
+      throw new Error(
+        `Invalid mutable natural-key property: table=${getTableName(table)}; property=${prop}. Identity, insert-only and access-scope properties cannot be mutable.`
+      );
+    }
+  }
+}
+
 export async function applyUpsert(
   tx: Transaction,
   table: DynamicPgTable,
   conflictKeyCols: KeyColumn[],
   primaryKeyCols: KeyColumn[],
   data: Record<string, unknown>,
-  opts?: {
-    /**
-     * Properties to omit from the UPDATE set (still inserted on first write).
-     * This is critical when upserting on a non-PK unique key.
-     */
-    omitSetProps?: readonly string[];
-  }
+  opts?: UpsertOptions
 ): Promise<void> {
   if (getTableName(table) === "excluded") {
     throw new Error(
@@ -54,6 +83,11 @@ export async function applyUpsert(
     );
   }
   const omit = opts?.omitSetProps ?? [];
+  const mutable = opts?.mutableNaturalKeyProps ?? [];
+  validateMutableNaturalKeys(table, conflictKeyCols, primaryKeyCols, opts);
+  const protectedKeyCols = conflictKeyCols.filter(
+    ({ prop }) => !mutable.includes(prop)
+  );
   const columns = getTableColumns(table);
   const setData: Record<string, unknown> = Object.fromEntries(
     Object.entries(data).filter(
@@ -83,7 +117,14 @@ export async function applyUpsert(
     }
   }
 
-  const write = { table, conflictKeyCols, primaryKeyCols, data, setData };
+  const write = {
+    table,
+    conflictKeyCols,
+    protectedKeyCols,
+    primaryKeyCols,
+    data,
+    setData,
+  };
 
   // Let PostgreSQL evaluate defaults, triggers and NULLS NOT DISTINCT. A failed
   // attempt must roll back before either inspecting catalogs or retrying.
@@ -132,12 +173,14 @@ async function writeUpsert(
   {
     table,
     conflictKeyCols,
+    protectedKeyCols,
     primaryKeyCols,
     data,
     setData,
   }: {
     table: DynamicPgTable;
     conflictKeyCols: KeyColumn[];
+    protectedKeyCols: KeyColumn[];
     primaryKeyCols: KeyColumn[];
     data: Record<string, unknown>;
     setData: Record<string, unknown>;
@@ -148,13 +191,20 @@ async function writeUpsert(
   // changed natural key could update a different row without ever hitting the
   // primary-key fallback. Keep the snapshot for detecting UPDATE-trigger edits.
   const [existing] = await transaction
-    .select()
+    .select(
+      Object.fromEntries(
+        [...primaryKeyCols, ...protectedKeyCols].map(({ prop, col }) => [
+          prop,
+          col,
+        ])
+      )
+    )
     .from(table)
     .where(and(...primaryKeyCols.map(({ col, prop }) => eq(col, data[prop]))))
     .for("update");
   const unchangedStoredKey = existing
     ? and(
-        ...conflictKeyCols.map(({ col, prop }) =>
+        ...protectedKeyCols.map(({ col, prop }) =>
           sql.join([
             col,
             sql.raw(" is not distinct from "),
@@ -169,7 +219,7 @@ async function writeUpsert(
   const matchingNaturalKey = usePrimaryKey
     ? and(
         ...primaryKeyCols.map(({ col, prop }) => eq(col, data[prop])),
-        ...conflictKeyCols.map(({ col }) =>
+        ...protectedKeyCols.map(({ col }) =>
           sql.join([
             col,
             sql.raw(" is not distinct from excluded."),
@@ -197,17 +247,17 @@ async function writeUpsert(
     });
   if (rows.length === 0) {
     const guardColumns = usePrimaryKey
-      ? conflictKeyCols.map(({ col }) => col.name).join(",")
+      ? protectedKeyCols.map(({ col }) => col.name).join(",")
       : "none";
     const explanation = usePrimaryKey
-      ? "Natural-key changes for an existing identity are not supported. " +
-        "Check for a changed natural key or identity and BEFORE INSERT/UPDATE triggers; " +
+      ? "Protected natural-key changes or identity reassignment are not supported. " +
+        "Check for a changed protected key or identity and BEFORE INSERT/UPDATE triggers; " +
         "the empty result does not identify which skipped the write."
       : "Check BEFORE INSERT/UPDATE triggers for a skipped write.";
     throw new Error(
       `Upsert returned no row: table=${getTableName(table)}; ` +
         `conflictTarget=(${targetCols.map((col) => col.name).join(",")}); ` +
-        `primaryKeyFallback=${usePrimaryKey}; naturalKeyGuard=(${guardColumns}). ` +
+        `primaryKeyFallback=${usePrimaryKey}; protectedKeyGuard=(${guardColumns}). ` +
         explanation
     );
   }
@@ -223,7 +273,7 @@ async function writeUpsert(
     (rows[0].identityMatches !== true || rows[0].storedKeyMatches !== true)
   ) {
     throw new Error(
-      `Natural-key changes for an existing identity are not supported: table=${getTableName(table)}. ` +
+      `Protected natural-key changes or identity reassignment are not supported: table=${getTableName(table)}. ` +
         "The returned identity or natural key changed; the write was rolled back."
     );
   }

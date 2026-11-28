@@ -104,6 +104,20 @@ export type PullTableRule =
   | { kind: "publicOnly"; column: string }
   | { kind: "orEqUserIdOrTrue"; column: string; orColumn: string };
 
+/** Columns controlling declarative read access must not become editable keys. */
+export function pullRuleProtectedProps(
+  rule: PullTableRule | undefined
+): string[] {
+  if (!rule || rule.kind === "rpc") return [];
+  if (rule.kind === "compound")
+    return rule.rules.flatMap(pullRuleProtectedProps);
+  const columns =
+    rule.kind === "orEqUserIdOrTrue"
+      ? [rule.column, rule.orColumn]
+      : [rule.column];
+  return columns.map(snakeToCamel);
+}
+
 export interface IPullConfig {
   tableRules?: Record<string, PullTableRule>;
 }
@@ -115,6 +129,8 @@ export interface IPushSanitizeRule {
 }
 
 export interface IPushUpsertRule {
+  /** Explicitly editable natural-key properties; never include ownership fields. */
+  mutableNaturalKeyProps?: string[];
   omitSetProps?: string[];
   retryMinimalPayloadKeepProps?: string[];
   /** SQLSTATE codes (e.g. "23505") that trigger a minimal-payload retry. */

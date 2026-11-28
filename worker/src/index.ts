@@ -31,8 +31,8 @@ import type {
   SyncSchemaDeps,
   WorkerTransaction,
 } from "./sync-schema";
-import { createSyncSchema } from "./sync-schema";
-import { applyUpsert } from "./upsert";
+import { createSyncSchema, pullRuleProtectedProps } from "./sync-schema";
+import { applyUpsert, validateMutableNaturalKeys } from "./upsert";
 
 const CORE_COL_DELETED = "deleted";
 const CORE_COL_LAST_MODIFIED_AT = "last_modified_at";
@@ -127,6 +127,21 @@ export function createWorker(artifacts: WorkerArtifacts) {
   getPushRule = schema.getPushRule;
   getPullRule = schema.getPullRule;
 
+  for (const tableName of SYNCABLE_TABLES) {
+    const pushRule = getPushRule(tableName);
+    if (!pushRule?.upsert?.mutableNaturalKeyProps?.length) continue;
+    const table = schemaTables[tableName];
+    if (!table)
+      throw new Error(
+        `Cannot validate mutable key policy: missing table=${tableName}`
+      );
+    validateMutableNaturalKeys(
+      table,
+      getConflictKeyColumns(tableName, table),
+      getPrimaryKeyColumns(tableName, table),
+      upsertOptions(tableName, pushRule)
+    );
+  }
   return { fetch };
 }
 
@@ -1085,6 +1100,20 @@ function preparePushData(
   return sanitized.data;
 }
 
+function upsertOptions(
+  tableName: string,
+  pushRule: IPushTableRule | undefined
+) {
+  return {
+    omitSetProps: pushRule?.upsert?.omitSetProps,
+    mutableNaturalKeyProps: pushRule?.upsert?.mutableNaturalKeyProps,
+    protectedProps: [
+      ...(pushRule?.bindAuthUserIdProps ?? []),
+      ...pullRuleProtectedProps(getPullRule(tableName)),
+    ],
+  };
+}
+
 async function applyUpsertWithRetry(
   tx: Transaction,
   table: DynamicPgTable,
@@ -1093,9 +1122,8 @@ async function applyUpsertWithRetry(
   change: IncomingSyncChange,
   pushRule: IPushTableRule | undefined
 ): Promise<void> {
-  const omitSetProps = pushRule?.upsert?.omitSetProps;
   const keepProps = pushRule?.upsert?.retryMinimalPayloadKeepProps;
-  const upsertOpts = omitSetProps ? ({ omitSetProps } as const) : undefined;
+  const upsertOpts = upsertOptions(change.table, pushRule);
 
   try {
     await applyUpsert(

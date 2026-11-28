@@ -346,3 +346,18 @@ Notes:
 - Codegen logic: `oosync/src/codegen-schema.ts`
 - Schema-agnostic table meta contract: `oosync/src/shared/table-meta.ts`
 - Worker sync schema + sanitization: `oosync/worker/src/sync-schema.ts`
+
+### Editable natural keys
+
+A consumer may configure `push.tableRules[table].upsert.mutableNaturalKeyProps`
+using Drizzle property names, such as `["label"]` for a user-editable label in a
+unique key. This allows edits under the same primary key, including filling a
+NULL placeholder. Unlisted key fields remain protected. Never include owner or
+collection authorization fields; primary-key, auth-bound, and insert-only fields
+are rejected in this option. Declarative pull-rule columns are automatically
+protected, including nested rules and `orColumn`. Invalid configuration fails
+when `createWorker` executes, before accepting uploads; per-upload validation
+remains in place. RPC ownership fields require explicit protection, such as
+`omitSetProps`. Authorization remains the caller's responsibility.
+Uniqueness conflicts with another existing identity still reject the transaction.
+After changing consumer configuration, regenerate its worker artifacts.
