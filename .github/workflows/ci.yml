@@ -13,6 +13,18 @@ jobs:
     name: Lint, check, types, and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -38,3 +50,8 @@ jobs:
       - name: Unit tests
         # Discovers all src tests, including browser-sqlite-migration.test.ts.
         run: npm run test:unit
+
+      - name: Postgres integration tests
+        env:
+          OOSYNC_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+        run: npm run test:postgres

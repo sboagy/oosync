@@ -57,10 +57,20 @@ uses the driver's `workerd` entry point and Cloudflare socket transport.
 
 Run `npm run test:postgres` against local Postgres to check Drizzle transactions,
 savepoint recovery, RPC array parameters, timestamp/JSON serialization and
-rollback. It defaults to local Supabase on port 54322; override with
-`OOSYNC_TEST_DATABASE_URL` (loopback hosts only). The suite uses temporary tables
-and does not migrate or modify consumer data. Consumer integration tests still
+rollback, plus nullable-key Worker upserts and duplicate handling. CI runs the
+same suite against PostgreSQL 17. It defaults to local Supabase on port 54322;
+override with `OOSYNC_TEST_DATABASE_URL` (loopback hosts only). The suite uses
+temporary tables and an isolated, disposable codegen test schema;
+it does not migrate or modify consumer data. Consumer integration tests still
 need to exercise authentication, sync policy and the deployed Worker runtime.
+
+Worker uploads must carry every primary-key component, including configured
+minimal-payload retries (which retain the original payload identity automatically). Update omissions must leave at least one update value.
+Nullable natural-key retries require a non-deferrable primary-key arbiter when
+PostgreSQL cannot resolve the conflict using the natural key. Unsupported
+identity fallback fails explicitly; it does not create or alter constraints.
+A table literally named `excluded` is rejected with a configuration diagnostic.
+See [Worker upsert behavior](ARCHITECTURE.md#runtime-flow) for the full contract.
 
 See the [Postgres.js migration guide](https://github.com/porsager/postgres#upgrading-from-v3)
 and [Cloudflare Node.js compatibility requirements](https://developers.cloudflare.com/workers/runtime-apis/nodejs/).

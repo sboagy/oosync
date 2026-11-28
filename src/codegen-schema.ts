@@ -575,7 +575,7 @@ function getSchemaTableNames(columns: IColumnRow[]): string[] {
 
 function createTableIdentifierMap(tables: string[]): Map<string, string> {
   const tableIdentByName = new Map<string, string>();
-  const usedIdents = new Set<string>();
+  const usedIdents = new Set<string>(["sql"]);
   for (const tableName of tables) {
     let ident = safeIdentifier(tableName);
     while (usedIdents.has(ident)) ident = `${ident}_`;
@@ -2488,6 +2488,7 @@ function getUsedPgBuilders(params: {
 function buildPgImportLines(params: {
   schema: string;
   usedBuilders: Set<string>;
+  usesRawDefault: boolean;
 }): string[] {
   const isNonPublicSchema = params.schema !== "public";
   const importTypes = [
@@ -2497,6 +2498,7 @@ function buildPgImportLines(params: {
     left.localeCompare(right, undefined, { sensitivity: "base" })
   );
   return [
+    ...(params.usesRawDefault ? ['import { sql } from "drizzle-orm";'] : []),
     `import { ${importTypes.join(", ")} } from "drizzle-orm/pg-core";`,
     "",
     ...(isNonPublicSchema
@@ -2545,7 +2547,13 @@ function buildPgColumnLine(params: {
     pieces.push(`$defaultFn(${parsedDefault.value})`);
   } else if (params.strict && params.column.column_default) {
     throw new Error(
-      `Unsupported default for ${params.tableName}.${params.column.column_name}: ${params.column.column_default}. Use --lenient to skip.`
+      `Unsupported default for ${params.tableName}.${params.column.column_name}: ${params.column.column_default}. Use --lenient to preserve the PostgreSQL expression.`
+    );
+  } else if (params.column.column_default) {
+    // PostgreSQL expressions need no dialect translation in the worker schema.
+    // Preserve both the expression and Drizzle's hasDefault flag in lenient mode.
+    pieces.push(
+      `default(sql.raw(${JSON.stringify(params.column.column_default)}))`
     );
   }
 
@@ -2627,6 +2635,19 @@ function buildPgSchemaTs(params: {
     ...buildPgImportLines({
       schema: params.schema,
       usedBuilders: getUsedPgBuilders({ tables, colsByTable }),
+      usesRawDefault:
+        !params.strict &&
+        params.columns.some(
+          (column) =>
+            Boolean(column.column_default) &&
+            !parsePgDefault({
+              pgType: normalizeType({
+                dataType: column.data_type,
+                udtName: column.udt_name,
+              }),
+              columnDefault: column.column_default,
+            })
+        ),
     }),
     ...tables.flatMap((tableName) => {
       const ident = tableIdentByName.get(tableName);

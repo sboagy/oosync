@@ -21,6 +21,7 @@ import type {
   SyncRequest,
   SyncResponse,
 } from "../../src/shared/protocol";
+import { findPostgresErrorLike } from "./db-errors";
 import { debug, setDebugEnabled } from "./debug";
 import type {
   DynamicPgTable,
@@ -31,6 +32,7 @@ import type {
   WorkerTransaction,
 } from "./sync-schema";
 import { createSyncSchema } from "./sync-schema";
+import { applyUpsert } from "./upsert";
 
 const CORE_COL_DELETED = "deleted";
 const CORE_COL_LAST_MODIFIED_AT = "last_modified_at";
@@ -137,57 +139,12 @@ export default createWorker;
 type PostgresClient = ReturnType<typeof postgres>;
 type DrizzleDb = ReturnType<typeof drizzle>;
 
-type PostgresJsErrorLike = {
-  message?: unknown;
-  code?: unknown;
-  detail?: unknown;
-  hint?: unknown;
-  table_name?: unknown;
-  column_name?: unknown;
-  constraint_name?: unknown;
-  cause?: unknown;
-};
-
-function isPostgresJsErrorLike(error: unknown): error is PostgresJsErrorLike {
-  return typeof error === "object" && error !== null;
-}
-
 function toOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function sortStrings(values: Iterable<string>): string[] {
   return [...values].sort((a, b) => a.localeCompare(b));
-}
-
-function getErrorCause(error: unknown): unknown {
-  if (!isPostgresJsErrorLike(error)) return undefined;
-  return error.cause;
-}
-
-function findPostgresErrorLike(
-  error: unknown
-): PostgresJsErrorLike | undefined {
-  // Some libraries wrap the underlying Postgres error under `cause`.
-  let current: unknown = error;
-  for (let depth = 0; depth < 4; depth += 1) {
-    if (isPostgresJsErrorLike(current)) {
-      // Heuristic: if it has any of the Postgres-ish fields, treat it as one.
-      if (
-        current.code !== undefined ||
-        current.detail !== undefined ||
-        current.constraint_name !== undefined ||
-        current.table_name !== undefined ||
-        current.column_name !== undefined
-      ) {
-        return current;
-      }
-    }
-    const next = getErrorCause(current);
-    if (next === undefined) break;
-    current = next;
-  }
-  return undefined;
 }
 
 function formatDbError(error: unknown): string {
@@ -1141,10 +1098,14 @@ async function applyUpsertWithRetry(
   const upsertOpts = omitSetProps ? ({ omitSetProps } as const) : undefined;
 
   try {
-    // Use a savepoint so a failed statement doesn't abort the outer transaction.
-    await tx.transaction(async (sp) => {
-      await applyUpsert(sp, table, keyCols, data, upsertOpts);
-    });
+    await applyUpsert(
+      tx,
+      table,
+      keyCols,
+      getPrimaryKeyColumns(change.table, table),
+      data,
+      upsertOpts
+    );
   } catch (e) {
     // Only retry when the error matches a configured retriable SQLSTATE or constraint.
     const retryOnSqlStates = pushRule?.upsert?.retryOnSqlStates;
@@ -1174,10 +1135,25 @@ async function applyUpsertWithRetry(
         e
       )}`
     );
-    const minimal = minimalPayload(data, keepProps);
-    await tx.transaction(async (sp) => {
-      await applyUpsert(sp, table, keyCols, minimal, upsertOpts);
-    });
+    // A retry must retain the upload's identity even when the configured
+    // optional-field projection predates the explicit-primary-key contract.
+    // Natural-key values must also survive: omission can invoke different defaults.
+    const identityProps = getPrimaryKeyColumns(change.table, table).map(
+      ({ prop }) => prop
+    );
+    const minimal = minimalPayload(data, [
+      ...keepProps,
+      ...identityProps,
+      ...keyCols.map(({ prop }) => prop),
+    ]);
+    await applyUpsert(
+      tx,
+      table,
+      keyCols,
+      getPrimaryKeyColumns(change.table, table),
+      minimal,
+      upsertOpts
+    );
   }
 }
 
@@ -1368,37 +1344,6 @@ async function applyDelete(
   }
 }
 
-async function applyUpsert(
-  tx: Transaction,
-  table: DynamicPgTable,
-  pkCols: { col: DrizzleColumn; prop: string }[],
-  data: Record<string, unknown>,
-  opts?: {
-    /**
-     * Properties to omit from the UPDATE set (still inserted on first write).
-     * This is critical when upserting on a non-PK unique key.
-     */
-    omitSetProps?: readonly string[];
-  }
-): Promise<void> {
-  const targetCols = pkCols.map((pk) => pk.col);
-
-  let setData: Record<string, unknown> = data;
-  const omit = opts?.omitSetProps ?? [];
-  if (omit.length > 0) {
-    setData = { ...data };
-    for (const prop of omit) {
-      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-      delete setData[prop];
-    }
-  }
-
-  await tx.insert(table).values(data).onConflictDoUpdate({
-    target: targetCols,
-    set: setData,
-  });
-}
-
 /**
  * Process all PUSH changes from the client.
  */
@@ -1410,7 +1355,8 @@ async function processPushChanges(
   debug.log(`[PUSH] Processing ${changes.length} changes from client`);
   for (const change of changes) {
     try {
-      await applyChange(tx, change, ctx);
+      // Preserve client write order and finish each row/savepoint before the next write.
+      await applyChange(tx, change, ctx); // NOSONAR: S9382 - writes may depend on preceding writes.
     } catch (e) {
       throw new Error(
         `[PUSH] Failed applying ${change.table} rowId=${change.rowId}: ${formatDbError(e)}`
@@ -1675,7 +1621,8 @@ async function processInitialSyncPaged(
       offset = 0;
       continue;
     }
-    const page = await collectInitialSyncPage({
+    // The preceding page determines the next table/offset and remaining page budget.
+    const pageRequest = collectInitialSyncPage({
       tx,
       ctx,
       tableName,
@@ -1686,6 +1633,7 @@ async function processInitialSyncPaged(
       timings,
       timingAggregates,
     });
+    const page = await pageRequest; // NOSONAR: S9382 - cursor traversal is sequential.
     pagesCollected += 1;
     const { changes } = page;
 
@@ -1875,24 +1823,20 @@ async function processIncrementalSync(
     return [];
   }
 
-  const allChanges: SyncChange[] = [];
-  for (const tableName of changedTables) {
-    // Only process tables we know about
+  const tablesToFetch = changedTables.filter((tableName) => {
     if (!SYNCABLE_TABLES.includes(tableName)) {
       debug.log(`[PULL:INCR] Skipping unknown table: ${tableName}`);
-      continue;
+      return false;
     }
-    if (ctx.pullTables && !ctx.pullTables.has(tableName)) {
-      continue;
-    }
-    const tableChanges = await fetchChangedRowsFromTable(
-      tx,
-      tableName,
-      lastSyncAt,
-      ctx
-    );
-    allChanges.push(...tableChanges);
-  }
+    return !ctx.pullTables || ctx.pullTables.has(tableName);
+  });
+  // Independent reads; Promise.all preserves table order regardless of completion order.
+  const changesByTable = await Promise.all(
+    tablesToFetch.map((tableName) =>
+      fetchChangedRowsFromTable(tx, tableName, lastSyncAt, ctx)
+    )
+  );
+  const allChanges = changesByTable.flat();
 
   debug.log(
     `[PULL:INCR] Completed incremental sync: ${allChanges.length} total changes`

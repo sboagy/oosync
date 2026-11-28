@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
 import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -10,10 +10,17 @@ const url = new URL(
   process.env.OOSYNC_TEST_DATABASE_URL ??
     "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 );
-assert.ok(
-  ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname),
-  "Postgres compatibility tests require a local database"
-);
+before(() => {
+  assert.equal(
+    url.search,
+    "",
+    "Test database URLs must not contain connection overrides"
+  );
+  assert.ok(
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname),
+    "Postgres compatibility tests require a local database"
+  );
+});
 const client = postgres(url.toString(), {
   max: 1,
   prepare: false,

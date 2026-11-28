@@ -194,38 +194,41 @@ export function createSyncSchema(deps: SyncSchemaDeps) {
     const collections = getWorkerConfig().collections ?? {};
     const result: Record<string, Set<string>> = {};
 
-    // Load configured per-user collections.
-    for (const [name, cfg] of Object.entries(collections)) {
-      if (params.collectionNames && !params.collectionNames.has(name)) {
-        continue;
-      }
+    // Collections are independent reads on the same transaction. Await all
+    // selected queries before exposing the completed collection map.
+    await Promise.all(
+      Object.entries(collections).map(async ([name, cfg]) => {
+        if (params.collectionNames && !params.collectionNames.has(name)) {
+          return;
+        }
 
-      const table = params.tables[cfg.table];
-      if (!table) {
-        result[name] = new Set();
-        continue;
-      }
+        const table = params.tables[cfg.table];
+        if (!table) {
+          result[name] = new Set();
+          return;
+        }
 
-      const idProp = snakeToCamel(cfg.idColumn);
-      const ownerProp = snakeToCamel(cfg.ownerColumn);
-      const idCol = table[idProp];
-      const ownerCol = table[ownerProp];
-      if (!idCol || !ownerCol) {
-        result[name] = new Set();
-        continue;
-      }
+        const idProp = snakeToCamel(cfg.idColumn);
+        const ownerProp = snakeToCamel(cfg.ownerColumn);
+        const idCol = table[idProp];
+        const ownerCol = table[ownerProp];
+        if (!idCol || !ownerCol) {
+          result[name] = new Set();
+          return;
+        }
 
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-      const rows = await params.tx
         // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-        .select({ id: idCol })
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-        .from(table)
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-        .where(eq(ownerCol, params.userId));
+        const rows = await params.tx
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+          .select({ id: idCol })
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+          .from(table)
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
+          .where(eq(ownerCol, params.userId));
 
-      result[name] = new Set(rows.map((row) => String(row.id)));
-    }
+        result[name] = new Set(rows.map((row) => String(row.id)));
+      })
+    );
 
     return result;
   }

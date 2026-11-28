@@ -122,6 +122,67 @@ Runtime flow is how data moves after a user changes local state:
 
 Default conflict handling is last-write-wins unless the consumer layers additional conflict behavior above the shared protocol.
 
+Worker upserts first use the configured unique key in a savepoint. PostgreSQL
+therefore determines conflicts using actual defaults, trigger effects, and the
+constraint's NULL-distinctness semantics. Only a primary-key violation verified
+against the live catalog (relation, constraint, and primary-key columns, following
+partition-parent constraints when applicable) permits
+an identity fallback after rollback of the failed attempt. Unrelated constraint
+failures, including nested PL/pgSQL trigger errors identified by PostgreSQL execution context, propagate unchanged. The fallback compares every natural-key component
+to the proposed insert with `IS NOT DISTINCT FROM`; a mismatch rejects the write.
+This prevents reassignment across natural-key boundaries, including ownership
+components, but does not replace caller authorization. Natural-key components are
+immutable through this sync upsert path, including NULL-to-value placeholder
+completion, value-to-value edits, and value-to-NULL edits. This batch enables
+repeat uploads with the same natural key; it does not enable natural-key edits.
+Supporting those edits needs a separate consumer-defined authorization policy.
+On identity fallback, an empty RETURNING result cannot distinguish guard rejection
+from a skipping trigger, so the diagnostic lists both possibilities without
+asserting a cause. On the natural-key path, it directs attention to skipping triggers.
+
+Known follow-up: a rejected natural-key edit aborts the push batch, and the retained
+outbox item can repeatedly block later uploads. This predates the fallback fix.
+Per-row rejection/quarantine needs a separate protocol and recovery design that
+preserves rejected local work and does not acknowledge unapplied writes.
+
+All uploads, including minimal-payload retries, must retain every primary-key
+component. Configured minimal-payload retries automatically retain both primary-key and natural-key components from the original payload. Database-generated identities are not a substitute for a stable sync
+identity. Empty or undefined-only update sets are rejected with configuration
+diagnostics. Updated natural-key properties use trigger-normalized `excluded`
+values, matching the fallback guard. Configured insert-only properties remain
+excluded from updates. A write returning no row is rejected rather than silently
+acknowledged; conflict conditions and skipping triggers can both cause this.
+The fallback has its own savepoint, checks the existing row identity before updating, and verifies every returned primary-key component against the upload identity. A trigger that changes identity on retry
+therefore causes rollback rather than silently inserting a different row.
+
+The configured unique arbiter must be usable by PostgreSQL's `ON CONFLICT`.
+Identity fallback additionally requires a non-deferrable primary-key arbiter.
+A deferrable primary key does not block successful natural-key inserts/updates,
+but an immediately checked duplicate requiring identity fallback gets an explicit
+unsupported-schema error without changing the stored row. Initially deferred
+violations are reported by PostgreSQL at outer transaction commit; the Worker
+must await that commit before acknowledging uploads. The helper cannot catch
+commit-time violations. No indexes or constraints are installed
+implicitly. A target table literally named `excluded` is unsupported because it conflicts with PostgreSQL's proposed-row namespace; the helper rejects it before executing SQL.
+
+Catalog lookup follows the same schema/search_path resolution as the INSERT.
+An unqualified table must not be forced to public only for catalog verification.
+Constraint results are intentionally not cached across requests: schema changes
+and session relation resolution could invalidate an isolate-wide cache. Measure
+batch latency before introducing a cache with a defined invalidation strategy.
+
+Each attempt locks an existing upload identity before inserting, and verifies the returned identity and natural key against that snapshot. This prevents a natural-key collision from silently updating a different existing identity and rejects BEFORE UPDATE key mutations. New identities may still deduplicate by natural key as configured. The lock adds one SELECT per attempt; batch latency across a deployed database connection remains to be measured. A row absent at the attempt may be inserted, including after a concurrent hard delete; this helper does not provide tombstone protection.
+
+Each attempt uses a driver savepoint inside an explicitly released boundary, so large batches do not retain one savepoint per row. The driver scope is required to isolate its failed-query tracking. Failure cleanup restores and releases the enclosing boundary; if cleanup also fails, an AggregateError retains both errors and stops retrying the unusable transaction. The normal path adds savepoint commands; only a primary-key-conflict retry
+adds a catalog query and another insert attempt. Transactional effects from the
+failed attempt roll back; PostgreSQL sequence consumption need not roll back.
+
+In lenient codegen, the PostgreSQL worker schema preserves otherwise unsupported
+database default expressions as SQL defaults. SQLite default translation and
+strict-mode validation are unchanged; consumers regenerate worker artifacts to
+pick up this metadata. Conflict selection does not infer default values from
+that metadata.
+
 ## Key Boundaries
 
 ### 1. Codegen Boundary
